@@ -40,6 +40,7 @@ DEFAULT_ROW = {
     "finish": "",
     "dimensions_mm": "",
     "category": "",
+    "catalogue_name": "",
     "cost_net": None,
     "rrp_net": None,
     "vat_rate": 0.2,
@@ -52,55 +53,90 @@ DEFAULT_ROW = {
 CANONICAL_ORDER = list(DEFAULT_ROW.keys())
 
 
-def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict) -> pd.DataFrame:
-    """
-    Core cleaning function.
-    Takes a raw supplier DataFrame + column mapping, returns a cleaned DataFrame
-    in the canonical schema.
-    """
-    # Start with an empty frame using canonical columns
+def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict):
+    # Build output frame using canonical order
     out = pd.DataFrame(columns=CANONICAL_ORDER)
     out = out.assign(**DEFAULT_ROW)
 
+    # Helper to safely extract mapped columns
     def get(col, default=""):
-        """
-        Helper to fetch a column based on mapping.
-        Returns a Series if the column exists, otherwise a Series of defaults.
-        """
         src = mapping.get(col)
-        if src in df.columns:
+        if src and src in df.columns:
             return df[src]
-        # fall back to a series of default values (same length as df)
         return pd.Series([default] * len(df))
 
+    # -----------------------------------------------------------
     # Basic fields
+    # -----------------------------------------------------------
     out["supplier"] = supplier
-    out["supplier_code"] = get("supplier_code")
+    out["supplier_code"] = get("supplier_code").astype(str).str.strip()
+
     raw_name = get("name")
     raw_finish = get("finish")
-    out["barcode"] = get("barcode")
+    raw_category = get("category")
+    raw_rrp = get("rrp_net")
 
     # VAT
     vat_series = get("vat_rate")
     out["vat_rate"] = _vat_series(vat_series, default=0.2)
 
-    # Extract dimensions from name and clean title
+    # -----------------------------------------------------------
+    # Name + dimensions extraction
+    # -----------------------------------------------------------
     name_clean, dims = zip(*raw_name.fillna("").map(_extract_dimensions))
     out["name"] = name_clean
     out["dimensions_mm"] = dims
 
-    # Finish normalisation
+    # -----------------------------------------------------------
+    # Finish
+    # -----------------------------------------------------------
     out["finish"] = raw_finish.fillna("").map(_normalise_finish)
 
-    # Costs
-    out["cost_net"] = get("cost_net").map(to_float)
-    out["rrp_net"] = get("rrp_net").map(to_float)
+    # -----------------------------------------------------------
+    # Category
+    # -----------------------------------------------------------
+    out["category"] = raw_category.fillna("").astype(str).str.strip()
 
-    # Deduplicate by supplier + supplier_code, keep first occurrence
+    # -----------------------------------------------------------
+    # RRP / Prices
+    # -----------------------------------------------------------
+    out["rrp_net"] = raw_rrp.map(to_float)
+
+    # -----------------------------------------------------------
+    # Create catalogue_name (Option B)
+    # -----------------------------------------------------------
+    def _safe_upper(val):
+        s = "" if val is None else str(val)
+        s = s.strip()
+        return s.upper() if s else ""
+
+    out["catalogue_name"] = (
+        out["category"].map(_safe_upper)
+        + ", "
+        + out["name"].map(_safe_upper)
+        + " - ("
+        + out["finish"].map(_safe_upper)
+        + ")"
+    )
+
+    # If no category → remove leading comma
+    mask_blank_cat = out["category"].astype(str).str.strip() == ""
+    out.loc[mask_blank_cat, "catalogue_name"] = (
+        out["name"].map(_safe_upper)
+        + " - ("
+        + out["finish"].map(_safe_upper)
+        + ")"
+    )
+
+    # -----------------------------------------------------------
+    # Deduplicate by supplier_code
+    # -----------------------------------------------------------
     out = out.fillna("")
     out = out.groupby(["supplier", "supplier_code"], as_index=False).first()
 
-    # Final column order
+    # -----------------------------------------------------------
+    # Return final frame in canonical order
+    # -----------------------------------------------------------
     out = out[CANONICAL_ORDER]
     return out
 
