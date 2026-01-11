@@ -53,7 +53,19 @@ DEFAULT_ROW = {
 CANONICAL_ORDER = list(DEFAULT_ROW.keys())
 
 
-def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict):
+def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None):
+    """
+    Core cleaning function.
+    - Maps supplier columns to canonical columns
+    - Cleans codes & titles
+    - Extracts dimensions
+    - Normalises finishes
+    - Rounds RRP to 2dp
+    - Optionally computes cost_net using a discount percentage
+    """
+    options = options or {}
+    discount_percent = float(options.get("discount_percent", 0.0))
+
     # Build output frame using canonical order
     out = pd.DataFrame(columns=CANONICAL_ORDER)
     out = out.assign(**DEFAULT_ROW)
@@ -69,12 +81,23 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict):
     # Basic fields
     # -----------------------------------------------------------
     out["supplier"] = supplier
-    out["supplier_code"] = get("supplier_code").astype(str).str.strip()
+
+    # Supplier code cleaning (SKU normalisation)
+    raw_code = get("supplier_code")
+    out["supplier_code"] = (
+        raw_code.astype(str)
+        .str.strip()
+        .str.replace(" ", "", regex=False)
+        .str.upper()
+    )
 
     raw_name = get("name")
     raw_finish = get("finish")
     raw_category = get("category")
     raw_rrp = get("rrp_net")
+    raw_barcode = get("barcode")
+
+    out["barcode"] = raw_barcode.fillna("").astype(str).str.strip()
 
     # VAT
     vat_series = get("vat_rate")
@@ -101,6 +124,21 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict):
     # RRP / Prices
     # -----------------------------------------------------------
     out["rrp_net"] = raw_rrp.map(to_float)
+    out["rrp_net"] = pd.to_numeric(out["rrp_net"], errors="coerce").fillna(0).round(2)
+
+    # -----------------------------------------------------------
+    # Optional discount → cost_net
+    # discount_percent may be 40 or 0.4
+    # -----------------------------------------------------------
+    disc = discount_percent
+    if disc > 1:
+        disc = disc / 100.0
+    if disc < 0:
+        disc = 0.0
+    if disc > 1:
+        disc = 1.0
+
+    out["cost_net"] = (out["rrp_net"] * (1 - disc)).round(2)
 
     # -----------------------------------------------------------
     # Create catalogue_name (Option B)
@@ -129,7 +167,7 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict):
     )
 
     # -----------------------------------------------------------
-    # Deduplicate by supplier_code
+    # Deduplicate by supplier + supplier_code
     # -----------------------------------------------------------
     out = out.fillna("")
     out = out.groupby(["supplier", "supplier_code"], as_index=False).first()
@@ -182,7 +220,6 @@ def _vat_series(series: pd.Series, default: float = 0.2) -> pd.Series:
             lambda x: _parse_vat_value(x, default)
         )
     except Exception:
-        # Fall back to flat default if anything goes wrong
         return pd.Series([default] * len(series))
 
 
@@ -197,5 +234,4 @@ def _parse_vat_value(x, default: float) -> float:
         val = float(s)
     except ValueError:
         return default
-    # If looks like "20", treat as 20% => 0.2
     return val / 100 if val > 1 else val

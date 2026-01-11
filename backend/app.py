@@ -22,6 +22,7 @@ async def preview(
     override = get_supplier_override(supplier)
     if override:
         mapping.update(override)
+
     cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping)
     return JSONResponse(cleaned.head(50).to_dict(orient="records"))
 
@@ -29,19 +30,21 @@ async def preview(
 @app.post("/export")
 async def export(
     file: UploadFile = File(...),
-    supplier: str = Form("unknown")
+    supplier: str = Form("unknown"),
+    discount_percent: float = Form(0.0),
 ):
     df = await _read_any(file)
     mapping = infer_column_mapping(df.columns)
     override = get_supplier_override(supplier)
     if override:
         mapping.update(override)
-    cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping)
+
+    options = {"discount_percent": discount_percent}
+    cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
     output = BytesIO()
     cleaned.to_excel(output, index=False)
     output.seek(0)
-
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
