@@ -65,18 +65,25 @@ def infer_column_mapping(columns):
 
 def _first_match(cols_normalised, candidates):
     """
-    Find the first candidate that matches exactly (case-insensitive),
-    otherwise fall back to fuzzy matching.
+    Find the best matching column name for any of the candidate phrases.
+
+    1) Try exact matches (case-insensitive).
+    2) Then try fuzzy matches for each candidate phrase.
     """
+    # 1) Exact / contains match
     for cand in candidates:
         cand_norm = cand.strip().lower()
         if cand_norm in cols_normalised:
             return cand_norm
 
-    main = candidates[0].strip().lower()
-    matches = get_close_matches(main, cols_normalised, n=1, cutoff=0.8)
-    return matches[0] if matches else None
+    # 2) Fuzzy match: try each candidate phrase against all columns
+    for cand in candidates:
+        cand_norm = cand.strip().lower()
+        matches = get_close_matches(cand_norm, cols_normalised, n=1, cutoff=0.8)
+        if matches:
+            return matches[0]
 
+    return None
 
 # ---- Supplier-specific overrides -------------------------------------------
 
@@ -93,8 +100,18 @@ SUPPLIER_OVERRIDES = {
 
 
 def get_supplier_override(supplier: str) -> dict:
-    """Return a mapping override for a given supplier, if we have one."""
+    """Return a mapping override for a given supplier, if we have one.
+
+    Uses case-insensitive match and also accepts names that start with
+    the known supplier key (e.g. "samuel heath jan26 list").
+    """
     if not supplier:
         return {}
     key = supplier.strip().lower()
-    return SUPPLIER_OVERRIDES.get(key, {})
+
+    for s_key, override in SUPPLIER_OVERRIDES.items():
+        if key == s_key or key.startswith(s_key):
+            return override
+
+    return {}
+
