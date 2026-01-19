@@ -52,12 +52,10 @@ def to_showroom_schema(
     df = canon.copy()
 
     # Ensure numeric/rounded RRP and cost
-    rrp = pd.to_numeric(df.get("rrp_net"), errors="coerce").fillna(0).round(2)
-    cost = pd.to_numeric(df.get("cost_net"), errors="coerce").fillna(0).round(2)
+    rrp = pd.to_numeric(df.get("rrp_ex_vat", df.get("rrp_net")), errors="coerce").fillna(0).round(2)
+    trade = pd.to_numeric(df.get("cost_ex_vat", df.get("cost_net")), errors="coerce").fillna(0).round(2)
+    cost = trade
 
-    # We already applied discount in Stage 1 to get cost_net.
-    # Here we just carry that forward.
-    trade = cost
 
     # VAT as percent (Intact usually expects 20 for 20%)
     vat_rate = pd.to_numeric(df.get("vat_rate", 0.2), errors="coerce").fillna(0.2)
@@ -94,7 +92,7 @@ def to_showroom_schema(
     out["Purchasing.DiscountLevel3"] = 0
     out["Purchasing.DiscountLevel4"] = 0
     out["Purchasing.TradePriceActual"] = trade
-    out["Purchasing.ListPriceCurrency"] = "GBP"
+    out["Purchasing.ListPriceCurrency"] = df.get("currency", "GBP")
     out["Purchasing.DefaultTaxRate"] = vat_percent
 
     out["Costings.StandardCost"] = trade
