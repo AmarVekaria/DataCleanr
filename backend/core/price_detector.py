@@ -32,8 +32,8 @@ def _score_rrp(h: str) -> int:
     score = 0
     if any(t in h for t in ["rrp", "msrp", "list price", "retail price", "retail"]):
         score += 8
-    if "price" in h:
-        score += 2
+    if h.strip() == "price":
+        score += 6
     if any(t in h for t in ["ex vat", "exvat", "net", "excluding vat"]):
         score += 4
     if _is_gross(h):

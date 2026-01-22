@@ -22,28 +22,24 @@ CANONICAL = [
 ]
 
 # Common alternative header names from suppliers
-ALIASES = {
-    "supplier": ["brand", "manufacturer"],
-    "supplier_code": [
-        "code",
-        "item code",
-        "item_code",
-        "mpn",
-        "manufacturer code",
-        "model",
-        "product no.",
-        "product no",
-        "product number",
+ALIASES = {}
+ALIASES.update({
+    "supplier_code": ALIASES.get("supplier_code", []) + [
+        "material", "material no", "material number",
+        "product no", "product number", "product code",
+        "item", "item no", "article", "article no",
+        "part no", "part number", "mpn", "model", "sku"
     ],
-    "name": ["description", "product", "product description", "title", "desc"],
-    "finish": ["colour", "color", "finish/colour", "surface", "finish colour", "finish"],
-    "category": ["range", "category", "product group", "master product group"],
-    "cost_net": ["cost", "net cost", "net_cost", "net", "buy price", "trade", "trade price"],
-    "rrp_net": ["rrp", "list price", "retail", "list price gbp 20", "list price gbp"],
-    "vat_rate": ["vat", "tax", "vat%", "vat rate"],
-    "barcode": ["ean", "upc", "barcode", "gtin", "ean code"],
-}
-
+    "name": ALIASES.get("name", []) + [
+        "product title", "short description", "full description", "title"
+    ],
+    "finish": ALIASES.get("finish", []) + ["colour", "color", "finish"],
+    "rrp_net": ALIASES.get("rrp_net", []) + [
+        "price", "list price", "rrp", "retail price", "unit price"
+    ],
+    "barcode": ALIASES.get("barcode", []) + ["ean", "gtin", "barcode", "upc"],
+    "category": ALIASES.get("category", []) + ["technical class", "line", "range", "class"],
+})
 
 def infer_column_mapping(columns):
     """
