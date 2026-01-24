@@ -3,7 +3,7 @@
 import re
 import pandas as pd
 
-from .validators import to_float
+from .validators import to_float, normalise_barcode
 from .price_detector import detect_prices
 
 # Regexes to extract dimensions from product titles/descriptions
@@ -103,7 +103,7 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     raw_category = get("category")
     raw_barcode = get("barcode")
 
-    out["barcode"] = raw_barcode.fillna("").astype(str).str.strip()
+    out["barcode"] = raw_barcode.map(normalise_barcode)
 
     # VAT
     vat_series = get("vat_rate")
