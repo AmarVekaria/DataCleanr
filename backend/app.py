@@ -15,9 +15,21 @@ app = FastAPI(title="DataCleanr MVP")
 # ---------------------------
 # Helpers
 # ---------------------------
-async def _read_any(upload: UploadFile) -> pd.DataFrame:
-    if upload.filename.lower().endswith(".csv"):
+async def _read_any(upload: UploadFile, sheet_name: str = "") -> pd.DataFrame:
+    """
+    Read CSV or Excel file into a pandas DataFrame.
+    - CSV: read_csv
+    - Excel: read_excel (optionally with sheet_name)
+    """
+    filename = (upload.filename or "").lower()
+
+    if filename.endswith(".csv"):
         return pd.read_csv(upload.file)
+
+    # Excel
+    if sheet_name and sheet_name.strip():
+        return pd.read_excel(upload.file, sheet_name=sheet_name.strip())
+
     return pd.read_excel(upload.file)
 
 
@@ -28,14 +40,23 @@ async def _read_any(upload: UploadFile) -> pd.DataFrame:
 async def preview(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
+    sheet_name: str = Form(""),
+    name_preference: str = Form("auto"),   # auto | short_description | product_title | full_description
+    code_length: int | None = Form(None),  # only pads if provided (e.g. 8 for Hansgrohe)
 ):
-    df = await _read_any(file)
+    df = await _read_any(file, sheet_name=sheet_name)
+
     mapping = infer_column_mapping(df.columns)
     override = get_supplier_override(supplier)
     if override:
         mapping.update(override)
 
-    cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping)
+    options = {
+        "name_preference": name_preference,
+        "code_length": code_length,  # None = no padding
+    }
+
+    cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
     return JSONResponse(cleaned.head(50).to_dict(orient="records"))
 
 
@@ -47,14 +68,23 @@ async def export(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
     discount_percent: float = Form(0.0),
+    sheet_name: str = Form(""),
+    name_preference: str = Form("auto"),   # auto | short_description | product_title | full_description
+    code_length: int | None = Form(None),  # only pads if provided
 ):
-    df = await _read_any(file)
+    df = await _read_any(file, sheet_name=sheet_name)
+
     mapping = infer_column_mapping(df.columns)
     override = get_supplier_override(supplier)
     if override:
         mapping.update(override)
 
-    options = {"discount_percent": discount_percent}
+    options = {
+        "discount_percent": discount_percent,
+        "name_preference": name_preference,
+        "code_length": code_length,  # None = no padding
+    }
+
     cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
     output = BytesIO()
@@ -77,8 +107,11 @@ async def export_showroom(
     supplier: str = Form("unknown"),
     discount_percent: float = Form(0.0),
     valid_from: str = Form(""),
+    sheet_name: str = Form(""),
+    name_preference: str = Form("auto"),   # auto | short_description | product_title | full_description
+    code_length: int | None = Form(None),  # only pads if provided
 ):
-    df = await _read_any(file)
+    df = await _read_any(file, sheet_name=sheet_name)
 
     # Stage 1 – canonical clean
     mapping = infer_column_mapping(df.columns)
@@ -86,7 +119,12 @@ async def export_showroom(
     if override:
         mapping.update(override)
 
-    options = {"discount_percent": discount_percent}
+    options = {
+        "discount_percent": discount_percent,
+        "name_preference": name_preference,
+        "code_length": code_length,  # None = no padding
+    }
+
     canon = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
     # Stage 2 – Showroom schema
@@ -106,10 +144,3 @@ async def export_showroom(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=showroom_upload.xlsx"},
     )
-
-async def _read_any(upload: UploadFile) -> pd.DataFrame:
-    """Read CSV or Excel file into a pandas DataFrame."""
-    filename = upload.filename.lower()
-    if filename.endswith(".csv"):
-        return pd.read_csv(upload.file)
-    return pd.read_excel(upload.file)
