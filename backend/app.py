@@ -13,11 +13,9 @@ from core.exporters import to_showroom_schema
 app = FastAPI(title="DataCleanr MVP")
 
 ALLOWED_NAME_PREFS = {"auto", "short_description", "product_title", "full_description"}
+ALLOWED_DEDUPE_MODES = {"keep_max_rrp", "keep_first"}
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
 def _validate_name_preference(name_preference: str) -> str:
     pref = (name_preference or "auto").strip().lower()
     if pref not in ALLOWED_NAME_PREFS:
@@ -31,22 +29,29 @@ def _validate_name_preference(name_preference: str) -> str:
     return pref
 
 
+def _validate_dedupe_mode(dedupe_mode: str) -> str:
+    mode = (dedupe_mode or "keep_max_rrp").strip().lower()
+    if mode not in ALLOWED_DEDUPE_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid dedupe_mode='{dedupe_mode}'. "
+                f"Allowed values: {sorted(ALLOWED_DEDUPE_MODES)}"
+            ),
+        )
+    return mode
+
+
 async def _read_any(upload: UploadFile, sheet_name: str = "") -> pd.DataFrame:
-    """
-    Read CSV or Excel file into a pandas DataFrame.
-    If sheet_name is provided for Excel, it must match exactly.
-    """
     filename = (upload.filename or "").lower()
 
     if filename.endswith(".csv"):
         return pd.read_csv(upload.file)
 
-    # Excel
     if sheet_name and sheet_name.strip():
         try:
             return pd.read_excel(upload.file, sheet_name=sheet_name.strip())
         except ValueError as e:
-            # Typically: Worksheet named 'X' not found
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -66,26 +71,40 @@ def _build_mapping(df: pd.DataFrame, supplier: str) -> dict:
     return mapping
 
 
-# ---------------------------
-# Preview endpoint
-# ---------------------------
 @app.post("/preview")
 async def preview(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
     sheet_name: str = Form(""),
+
+    # how to pick the base name if you don't provide merge_fields
     name_preference: str = Form("auto"),
+
+    # code padding (Hansgrohe codes = 8)
     code_length: int | None = Form(None),
+
+    # retailer-controlled merge recipe for catalogue_name
+    merge_fields: str = Form(""),          # e.g. "Short Description,Colour"
+    merge_dedupe: bool = Form(True),
+
+    # NEW: duplicate control
+    dedupe_by_supplier_column: str = Form("Brand"),  # default for your request
+    dedupe_mode: str = Form("keep_max_rrp"),
 ):
     try:
         pref = _validate_name_preference(name_preference)
+        mode = _validate_dedupe_mode(dedupe_mode)
 
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
 
         options = {
             "name_preference": pref,
-            "code_length": code_length,  # None = no padding
+            "code_length": code_length,
+            "merge_fields": merge_fields,
+            "merge_dedupe": merge_dedupe,
+            "dedupe_by_supplier_column": dedupe_by_supplier_column,
+            "dedupe_mode": mode,
         }
 
         cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
@@ -98,9 +117,6 @@ async def preview(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
-# ---------------------------
-# Canonical export
-# ---------------------------
 @app.post("/export")
 async def export(
     file: UploadFile = File(...),
@@ -109,9 +125,18 @@ async def export(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
+
+    # retailer-controlled merge recipe
+    merge_fields: str = Form(""),
+    merge_dedupe: bool = Form(True),
+
+    # NEW: duplicate control
+    dedupe_by_supplier_column: str = Form("Brand"),
+    dedupe_mode: str = Form("keep_max_rrp"),
 ):
     try:
         pref = _validate_name_preference(name_preference)
+        mode = _validate_dedupe_mode(dedupe_mode)
 
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
@@ -119,7 +144,11 @@ async def export(
         options = {
             "discount_percent": discount_percent,
             "name_preference": pref,
-            "code_length": code_length,  # None = no padding
+            "code_length": code_length,
+            "merge_fields": merge_fields,
+            "merge_dedupe": merge_dedupe,
+            "dedupe_by_supplier_column": dedupe_by_supplier_column,
+            "dedupe_mode": mode,
         }
 
         cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
@@ -141,9 +170,6 @@ async def export(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
-# ---------------------------
-# Showroom / Intact export
-# ---------------------------
 @app.post("/export-showroom")
 async def export_showroom(
     file: UploadFile = File(...),
@@ -153,24 +179,33 @@ async def export_showroom(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
+
+    merge_fields: str = Form(""),
+    merge_dedupe: bool = Form(True),
+
+    # NEW: duplicate control
+    dedupe_by_supplier_column: str = Form("Brand"),
+    dedupe_mode: str = Form("keep_max_rrp"),
 ):
     try:
         pref = _validate_name_preference(name_preference)
+        mode = _validate_dedupe_mode(dedupe_mode)
 
         df = await _read_any(file, sheet_name=sheet_name)
-
-        # Stage 1 – canonical clean
         mapping = _build_mapping(df, supplier)
 
         options = {
             "discount_percent": discount_percent,
             "name_preference": pref,
-            "code_length": code_length,  # None = no padding
+            "code_length": code_length,
+            "merge_fields": merge_fields,
+            "merge_dedupe": merge_dedupe,
+            "dedupe_by_supplier_column": dedupe_by_supplier_column,
+            "dedupe_mode": mode,
         }
 
         canon = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
-        # Stage 2 – Showroom schema
         showroom_df = to_showroom_schema(
             canon,
             supplier=supplier,
