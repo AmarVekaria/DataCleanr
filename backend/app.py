@@ -124,21 +124,19 @@ async def preview(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
-@app.post("/export")
-async def export(
+@app.post("/preview")
+async def preview(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
-    discount_percent: float = Form(0.0),
     sheet_name: str = Form(""),
+
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
 
-    # description merge (retailer-controlled)
     merge_fields: str = Form(""),
     merge_template: str = Form(""),
     merge_dedupe: bool = Form(True),
 
-    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -149,8 +147,10 @@ async def export(
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
 
+        # NEW: suggestions from the raw file headers
+        suggestions = suggest_merge_candidates(df)
+
         options = {
-            "discount_percent": discount_percent,
             "name_preference": pref,
             "code_length": code_length,
             "merge_fields": merge_fields,
@@ -158,22 +158,15 @@ async def export(
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
-            "return_report": True,
+            "return_report": False,
         }
 
-        cleaned, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+        cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
-            report.to_excel(writer, index=False, sheet_name="Report")
-        output.seek(0)
-
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=cleaned_with_report.xlsx"},
-        )
+        return JSONResponse({
+            "suggestions": suggestions,
+            "preview_rows": cleaned.head(50).to_dict(orient="records"),
+        })
 
     except HTTPException:
         raise
