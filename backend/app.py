@@ -9,6 +9,8 @@ import traceback
 from core.cleaner import clean_dataframe
 from core.mappings import infer_column_mapping, get_supplier_override
 from core.exporters import to_showroom_schema
+from core.detectors import suggest_merge_candidates
+
 
 app = FastAPI(title="DataCleanr MVP")
 
@@ -77,18 +79,13 @@ async def preview(
     supplier: str = Form("unknown"),
     sheet_name: str = Form(""),
 
-    # base-name preference if you do NOT provide merge_fields/template
     name_preference: str = Form("auto"),
-
-    # code padding (Hansgrohe codes = 8)
     code_length: int | None = Form(None),
 
-    # description merge (retailer-controlled)
-    merge_fields: str = Form(""),           # e.g. "Short Description,Colour"
-    merge_template: str = Form(""),         # e.g. "{Short Description} - '{Colour}'"
+    merge_fields: str = Form(""),
+    merge_template: str = Form(""),
     merge_dedupe: bool = Form(True),
 
-    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -98,6 +95,9 @@ async def preview(
 
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
+
+        # NEW: suggestions from the raw file headers
+        suggestions = suggest_merge_candidates(df)
 
         options = {
             "name_preference": pref,
@@ -111,7 +111,11 @@ async def preview(
         }
 
         cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
-        return JSONResponse(cleaned.head(50).to_dict(orient="records"))
+
+        return JSONResponse({
+            "suggestions": suggestions,
+            "preview_rows": cleaned.head(50).to_dict(orient="records"),
+        })
 
     except HTTPException:
         raise
