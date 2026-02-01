@@ -76,10 +76,19 @@ async def preview(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
     sheet_name: str = Form(""),
+
+    # base-name preference if you do NOT provide merge_fields/template
     name_preference: str = Form("auto"),
+
+    # code padding (Hansgrohe codes = 8)
     code_length: int | None = Form(None),
-    merge_fields: str = Form(""),
+
+    # description merge (retailer-controlled)
+    merge_fields: str = Form(""),           # e.g. "Short Description,Colour"
+    merge_template: str = Form(""),         # e.g. "{Short Description} - '{Colour}'"
     merge_dedupe: bool = Form(True),
+
+    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -94,6 +103,7 @@ async def preview(
             "name_preference": pref,
             "code_length": code_length,
             "merge_fields": merge_fields,
+            "merge_template": merge_template,
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
@@ -118,8 +128,13 @@ async def export(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
+
+    # description merge (retailer-controlled)
     merge_fields: str = Form(""),
+    merge_template: str = Form(""),
     merge_dedupe: bool = Form(True),
+
+    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -135,6 +150,7 @@ async def export(
             "name_preference": pref,
             "code_length": code_length,
             "merge_fields": merge_fields,
+            "merge_template": merge_template,
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
@@ -171,8 +187,13 @@ async def export_showroom(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
+
+    # description merge (retailer-controlled)
     merge_fields: str = Form(""),
+    merge_template: str = Form(""),
     merge_dedupe: bool = Form(True),
+
+    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -188,6 +209,7 @@ async def export_showroom(
             "name_preference": pref,
             "code_length": code_length,
             "merge_fields": merge_fields,
+            "merge_template": merge_template,
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,

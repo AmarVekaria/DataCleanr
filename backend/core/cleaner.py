@@ -37,6 +37,8 @@ DIMENSION_REGEXES = [
     re.compile(r"\b[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*mm\b", re.I),
 ]
 
+PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")  # {Column Heading}
+
 
 def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None):
     """
@@ -48,11 +50,13 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     discount_percent = float(options.get("discount_percent", 0.0) or 0.0)
     code_length = options.get("code_length", None)
 
-    merge_fields_raw = (options.get("merge_fields") or "").strip()
+    # Retailer-controlled merge
+    merge_fields_raw = (options.get("merge_fields") or "").strip()         # "Short Description,Colour"
+    merge_template = (options.get("merge_template") or "").strip()         # "{Short Description} - '{Colour}'"
     merge_dedupe = bool(options.get("merge_dedupe", True))
 
     # Dedup controls
-    dedupe_by_supplier_column = (options.get("dedupe_by_supplier_column") or "").strip()  # e.g. Brand
+    dedupe_by_supplier_column = (options.get("dedupe_by_supplier_column") or "").strip()  # Brand
     dedupe_mode = (options.get("dedupe_mode") or "keep_max_rrp").strip().lower()          # keep_max_rrp | keep_first
 
     return_report = bool(options.get("return_report", False))
@@ -101,10 +105,11 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     out["uom"] = _get_series("uom", "each").astype(str).fillna("each").str.strip()
     out["category"] = _get_series("category", "").astype(str).fillna("").str.strip()
 
-    # --- catalogue_name ---
+    # --- catalogue_name (template > fields > fallback) ---
     out["catalogue_name"] = _build_catalogue_name(
         df=df,
         out=out,
+        merge_template=merge_template,
         merge_fields_raw=merge_fields_raw,
         merge_dedupe=merge_dedupe,
     )
@@ -200,22 +205,70 @@ def _parse_vat(x):
         return 0.2
 
 
-def _build_catalogue_name(df: pd.DataFrame, out: pd.DataFrame, merge_fields_raw: str, merge_dedupe: bool) -> pd.Series:
+def _build_catalogue_name(
+    df: pd.DataFrame,
+    out: pd.DataFrame,
+    merge_template: str,
+    merge_fields_raw: str,
+    merge_dedupe: bool,
+) -> pd.Series:
     """
-    If merge_fields_raw provided (comma separated supplier headings),
-    build catalogue_name from those supplier columns.
-
-    For exactly 2 fields (Hansgrohe use-case):
-    -> "SHORT DESCRIPTION - 'COLOUR'" (colour optional; skip if blank)
-
-    For 3+ fields:
-    -> join with ", " (still blank-safe)
+    Priority:
+      1) merge_template (uses supplier headings in {...})
+      2) merge_fields (comma separated supplier headings)
+      3) fallback: name + finish
 
     Always uppercases final output.
     """
+
+    # 1) Template mode
+    if merge_template:
+        placeholders = [p.strip() for p in PLACEHOLDER_RE.findall(merge_template) if p.strip()]
+
+        # Pre-load series for each placeholder (missing columns become blanks)
+        series_map = {}
+        for col in placeholders:
+            if col in df.columns:
+                series_map[col] = df[col].astype(str).fillna("").str.strip()
+            else:
+                series_map[col] = pd.Series([""] * len(df), index=df.index)
+
+        merged = []
+        for i in range(len(df)):
+            # raw values for dedupe (optional)
+            raw_vals = []
+            for col in placeholders:
+                v = (series_map[col].iloc[i] or "").strip()
+                if v and v.lower() != "nan":
+                    raw_vals.append(v)
+
+            if merge_dedupe and len(raw_vals) >= 2:
+                raw_vals = _dedupe_parts(raw_vals)
+
+            # Build rendered string by replacing placeholders with actual values (or "")
+            rendered = merge_template
+            for col in placeholders:
+                v = (series_map[col].iloc[i] or "").strip()
+                if not v or v.lower() == "nan":
+                    v = ""
+                rendered = rendered.replace("{" + col + "}", v)
+
+            # Clean up artefacts when optional values are blank:
+            rendered = _cleanup_optional_template(rendered)
+
+            # If template resulted in basically empty punctuation, fall back to joined raw_vals
+            cleaned = rendered.strip()
+            cleaned = cleaned.strip("- ,|")
+            if not cleaned:
+                cleaned = " - ".join(raw_vals) if raw_vals else ""
+
+            merged.append(cleaned)
+
+        return pd.Series(merged, index=df.index).str.upper()
+
+    # 2) Fields mode
     if merge_fields_raw:
         fields = [f.strip() for f in merge_fields_raw.split(",") if f.strip()]
-
         parts = []
         for f in fields:
             if f in df.columns:
@@ -246,7 +299,7 @@ def _build_catalogue_name(df: pd.DataFrame, out: pd.DataFrame, merge_fields_raw:
 
         return pd.Series(merged, index=df.index).str.upper()
 
-    # fallback
+    # 3) Fallback
     base = out.get("name", "").astype(str).fillna("").str.strip()
     fin = out.get("finish", "").astype(str).fillna("").str.strip()
 
@@ -259,6 +312,34 @@ def _build_catalogue_name(df: pd.DataFrame, out: pd.DataFrame, merge_fields_raw:
         else:
             merged.append((b or "").upper())
     return pd.Series(merged, index=out.index)
+
+
+def _cleanup_optional_template(s: str) -> str:
+    """
+    Removes common artefacts when optional parts are blank, e.g.
+      "ABC - ''" -> "ABC"
+      "ABC - '' " -> "ABC"
+      "ABC - '" -> "ABC"
+      "ABC -  " -> "ABC"
+    Also collapses multiple spaces.
+    """
+    # Remove empty quoted blocks: '' or "" or ' ' or " "
+    s = re.sub(r"\s*-\s*''\s*$", "", s)
+    s = re.sub(r"\s*-\s*\"\"\s*$", "", s)
+
+    # If quotes remain but nothing inside, remove them
+    s = re.sub(r"'\s*'\s*$", "", s)
+    s = re.sub(r"\"\s*\"\s*$", "", s)
+
+    # Clean stray punctuation at end
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.rstrip(" -,")
+
+    # If we end up with "- '" or "- \"" at end, strip again
+    s = re.sub(r"\s*-\s*['\"]\s*$", "", s).strip()
+
+    return s
 
 
 def _dedupe_parts(vals: list[str]) -> list[str]:
@@ -294,22 +375,11 @@ def _dedupe_parts(vals: list[str]) -> list[str]:
 def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_col: str, mode: str):
     """
     Returns (kept_df, report_df)
-
     Dedup key:
       - (supplier, supplier_code) OR (supplier, supplier_code, <supplier_col>)
-    supplier_col example: "Brand"
-
-    Report logs:
-      - key fields
-      - count before
-      - distinct rrps/costs
-      - kept values
-      - kept original row index
-      - reason flags
     """
     df = out.copy()
 
-    # Build dedupe key
     key_cols = ["supplier", "supplier_code"]
     temp_key_name = None
 
@@ -318,10 +388,10 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
         df[temp_key_name] = df_source[supplier_col].astype(str).fillna("").str.strip()
         key_cols.append(temp_key_name)
 
-    # If no duplicates, return empty report
+    # Empty report if no duplicates
     if not df.duplicated(subset=key_cols, keep=False).any():
         report = pd.DataFrame(columns=[
-            "supplier", "supplier_code", supplier_col or "group",
+            "supplier", "supplier_code", (supplier_col if supplier_col else "group"),
             "duplicate_count", "rrp_values", "cost_values",
             "kept_rrp", "kept_cost", "kept_source_row",
             "flag"
@@ -330,11 +400,9 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
             df = df.drop(columns=[temp_key_name])
         return df, report
 
-    # Numeric helper columns
     df["__rrp_num__"] = pd.to_numeric(df["rrp_net"], errors="coerce").fillna(0.0).round(2)
     df["__cost_num__"] = pd.to_numeric(df["cost_net"], errors="coerce").fillna(0.0).round(2)
 
-    # Build a per-group summary report FIRST (before dropping rows)
     grouped = df.groupby(key_cols, dropna=False)
 
     report_rows = []
@@ -346,28 +414,19 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
         costs = sorted(g["__cost_num__"].unique().tolist())
         price_conflict = (len(rrps) > 1) or (len(costs) > 1)
 
-        # Decide which row to keep
         if mode == "keep_first":
             kept_row = g.sort_index().iloc[0]
         else:
             kept_row = g.sort_values("__rrp_num__", ascending=False).iloc[0]
 
-        flag = "DUPLICATE_CODE"
-        if price_conflict:
-            flag = "DUPLICATE_CODE_DIFF_PRICE"
+        flag = "DUPLICATE_CODE_DIFF_PRICE" if price_conflict else "DUPLICATE_CODE"
 
-        supplier_val = kept_row.get("supplier", "")
-        code_val = kept_row.get("supplier_code", "")
-
-        if temp_key_name:
-            supplier_group_val = kept_row.get(temp_key_name, "")
-        else:
-            supplier_group_val = ""
+        group_val = kept_row.get(temp_key_name, "") if temp_key_name else ""
 
         report_rows.append({
-            "supplier": supplier_val,
-            "supplier_code": code_val,
-            (supplier_col if supplier_col else "group"): supplier_group_val,
+            "supplier": kept_row.get("supplier", ""),
+            "supplier_code": kept_row.get("supplier_code", ""),
+            (supplier_col if supplier_col else "group"): group_val,
             "duplicate_count": int(len(g)),
             "rrp_values": ", ".join([f"{x:.2f}" for x in rrps]),
             "cost_values": ", ".join([f"{x:.2f}" for x in costs]),
@@ -379,13 +438,13 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
 
     report_df = pd.DataFrame(report_rows)
 
-    # Now keep rows according to mode
+    # Keep rows
     if mode == "keep_first":
         kept = df.sort_index().groupby(key_cols, as_index=False).head(1)
     else:
         kept = df.sort_values("__rrp_num__", ascending=False).groupby(key_cols, as_index=False).head(1)
 
-    # Append notes flag to kept rows where conflict exists
+    # Flag kept rows in notes if conflict
     conflict_keys = set(report_df.loc[report_df["flag"] == "DUPLICATE_CODE_DIFF_PRICE", ["supplier", "supplier_code"]].apply(tuple, axis=1).tolist())
 
     def _append_note(existing: str, note: str) -> str:
@@ -403,7 +462,7 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
         axis=1
     )
 
-    # Cleanup temp/internal cols
+    # Cleanup
     drop_cols = ["__rrp_num__", "__cost_num__"]
     if temp_key_name and temp_key_name in kept.columns:
         drop_cols.append(temp_key_name)
