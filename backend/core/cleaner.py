@@ -2,38 +2,9 @@
 
 import re
 import pandas as pd
+from .validators import to_float
 
-from .validators import to_float, normalise_barcode
-from .price_detector import detect_prices
 
-# Regexes to extract dimensions from product titles/descriptions
-DIMENSION_REGEXES = [
-    # e.g. L:425 X W:177 X H:154MM
-    re.compile(
-        r"\b[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*mm\b",
-        re.I,
-    ),
-    # e.g. 425x177x154 mm
-    re.compile(
-        r"\b(\d{2,4})\s*[x×]\s*(\d{2,4})\s*[x×]\s*(\d{2,4})\s*mm\b",
-        re.I,
-    ),
-    # e.g. H154 x W177 x D425
-    re.compile(
-        r"\b[hwd](\d{2,4})\s*[x×]\s*w(\d{2,4})\s*[x×]\s*d(\d{2,4})\b",
-        re.I,
-    ),
-]
-
-# Canonical finishes map (extend as you meet new supplier variants)
-FINISH_CANON = {
-    "white matt": "Matt White",
-    "matt white": "Matt White",
-    "chrome": "Chrome",
-    "polished chrome": "Chrome",
-}
-
-# Default row template (canonical schema)
 DEFAULT_ROW = {
     "supplier": "",
     "supplier_code": "",
@@ -43,13 +14,8 @@ DEFAULT_ROW = {
     "dimensions_mm": "",
     "category": "",
     "catalogue_name": "",
-    # Canonical pricing (ex-VAT)
-    "rrp_ex_vat": None,
-    "cost_ex_vat": None,
-    "currency": "GBP",
-    # Backwards compatibility (we set these = ex-VAT fields)
-    "cost_net": None,
-    "rrp_net": None,
+    "cost_net": 0.0,
+    "rrp_net": 0.0,
     "vat_rate": 0.2,
     "uom": "each",
     "pack_size": 1,
@@ -59,208 +25,388 @@ DEFAULT_ROW = {
 
 CANONICAL_ORDER = list(DEFAULT_ROW.keys())
 
+FINISH_CANON = {
+    "white matt": "Matt White",
+    "matt white": "Matt White",
+    "chrome": "Chrome",
+    "polished chrome": "Chrome",
+}
 
-def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None) -> pd.DataFrame:
+DIMENSION_REGEXES = [
+    re.compile(r"\b(\d{2,4})\s*[x×]\s*(\d{2,4})\s*[x×]\s*(\d{2,4})\s*mm\b", re.I),
+    re.compile(r"\b[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*[x×]\s*[lhwd]:?\s*(\d{2,4})\s*mm\b", re.I),
+]
+
+
+def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None):
     """
-    Core cleaning function.
-    - Maps supplier columns to canonical columns
-    - Cleans codes & titles
-    - Extracts dimensions
-    - Normalises finishes
-    - Robustly detects RRP column across suppliers (even if header differs)
-    - Produces rrp_ex_vat and cost_ex_vat (and keeps rrp_net/cost_net for compatibility)
-    - cost_ex_vat is derived from discount_percent when suppliers usually only provide RRP
+    If options['return_report'] is True -> returns (cleaned_df, report_df)
+    Else -> returns cleaned_df only
     """
     options = options or {}
 
-    # Build output frame using canonical order
-    out = pd.DataFrame(columns=CANONICAL_ORDER)
-    out = out.assign(**DEFAULT_ROW)
+    discount_percent = float(options.get("discount_percent", 0.0) or 0.0)
+    code_length = options.get("code_length", None)
 
-    # Helper to safely extract mapped columns
-    def get(col, default=""):
-        src = mapping.get(col)
+    merge_fields_raw = (options.get("merge_fields") or "").strip()
+    merge_dedupe = bool(options.get("merge_dedupe", True))
+
+    # Dedup controls
+    dedupe_by_supplier_column = (options.get("dedupe_by_supplier_column") or "").strip()  # e.g. Brand
+    dedupe_mode = (options.get("dedupe_mode") or "keep_max_rrp").strip().lower()          # keep_max_rrp | keep_first
+
+    return_report = bool(options.get("return_report", False))
+
+    out = pd.DataFrame(index=df.index, columns=CANONICAL_ORDER)
+    for k, v in DEFAULT_ROW.items():
+        out[k] = v
+
+    def _get_series(canon_key: str, default=""):
+        src = mapping.get(canon_key)
         if src and src in df.columns:
             return df[src]
-        return pd.Series([default] * len(df))
+        return pd.Series([default] * len(df), index=df.index)
 
-    # -----------------------------------------------------------
-    # Basic fields
-    # -----------------------------------------------------------
+    # --- Basics ---
     out["supplier"] = supplier
 
-    # Supplier code cleaning (SKU normalisation)
-    raw_code = get("supplier_code")
-    out["supplier_code"] = (
-        raw_code.astype(str)
-        .str.strip()
-        .str.replace(" ", "", regex=False)
-        .str.upper()
+    supplier_code = _get_series("supplier_code", "")
+    out["supplier_code"] = supplier_code.map(lambda x: _clean_code(x, code_length))
+
+    raw_name = _get_series("name", "")
+    raw_finish = _get_series("finish", "")
+
+    name_clean, dims = zip(*raw_name.map(_extract_dimensions_safe))
+    out["name"] = list(name_clean)
+    out["dimensions_mm"] = list(dims)
+
+    out["finish"] = raw_finish.map(_normalise_finish)
+
+    # RRP + Cost
+    rrp = _get_series("rrp_net", 0).map(to_float).fillna(0.0)
+    cost = _get_series("cost_net", 0).map(to_float).fillna(0.0)
+
+    out["rrp_net"] = rrp.round(2)
+
+    if (cost == 0).all() and discount_percent > 0:
+        out["cost_net"] = (out["rrp_net"] * (1 - (discount_percent / 100.0))).round(2)
+    else:
+        out["cost_net"] = cost.round(2)
+
+    # VAT rate
+    vat = _get_series("vat_rate", 0.2)
+    out["vat_rate"] = vat.map(_parse_vat).fillna(0.2)
+
+    out["barcode"] = _get_series("barcode", "").astype(str).fillna("").str.strip()
+    out["uom"] = _get_series("uom", "each").astype(str).fillna("each").str.strip()
+    out["category"] = _get_series("category", "").astype(str).fillna("").str.strip()
+
+    # --- catalogue_name ---
+    out["catalogue_name"] = _build_catalogue_name(
+        df=df,
+        out=out,
+        merge_fields_raw=merge_fields_raw,
+        merge_dedupe=merge_dedupe,
     )
 
-    raw_name = get("name")
-    raw_finish = get("finish")
-    raw_category = get("category")
-    raw_barcode = get("barcode")
-
-    out["barcode"] = raw_barcode.map(normalise_barcode)
-
-    # VAT
-    vat_series = get("vat_rate")
-    out["vat_rate"] = _vat_series(vat_series, default=0.2)
-
-    # -----------------------------------------------------------
-    # Name + dimensions extraction
-    # -----------------------------------------------------------
-    name_clean, dims = zip(*raw_name.fillna("").map(_extract_dimensions))
-    out["name"] = name_clean
-    out["dimensions_mm"] = dims
-
-    # -----------------------------------------------------------
-    # Finish
-    # -----------------------------------------------------------
-    out["finish"] = raw_finish.fillna("").map(_normalise_finish)
-
-    # -----------------------------------------------------------
-    # Category
-    # -----------------------------------------------------------
-    out["category"] = raw_category.fillna("").astype(str).str.strip()
-
-    # -----------------------------------------------------------
-    # Robust pricing (RRP-first, cost derived from discount)
-    # -----------------------------------------------------------
-    det = detect_prices(df)
-    out["currency"] = det.currency
-
-    # Discount: allow 40 or 0.4
-    disc = float(options.get("discount_percent", 0.0))
-    if disc > 1:
-        disc = disc / 100.0
-    disc = max(0.0, min(1.0, disc))
-
-    # Pick RRP source:
-    # 1) Prefer explicit mapped rrp_net column (intended ex-VAT)
-    # 2) Else auto-detect a likely list/rrp column
-    if "rrp_net" in mapping and mapping.get("rrp_net") in df.columns:
-        raw_rrp = df[mapping["rrp_net"]]
-        rrp_is_gross = False
-    else:
-        raw_rrp = df[det.rrp_col] if det.rrp_col else pd.Series([None] * len(df))
-        rrp_is_gross = det.rrp_is_gross
-
-    rrp = pd.to_numeric(raw_rrp.map(to_float), errors="coerce")
-
-    # Convert gross->exVAT if needed
-    vat = out["vat_rate"].replace({0: 0.2}).fillna(det.vat_rate)
-    if rrp_is_gross:
-        rrp = rrp / (1 + vat)
-
-    out["rrp_ex_vat"] = rrp.fillna(0).round(2)
-
-    # Cost source:
-    # 1) If a true trade/cost column exists, use it
-    # 2) Else derive from discount_percent off RRP
-    if det.trade_col and det.trade_col in df.columns:
-        raw_trade = df[det.trade_col]
-        trade = pd.to_numeric(raw_trade.map(to_float), errors="coerce")
-        if det.trade_is_gross:
-            trade = trade / (1 + vat)
-        out["cost_ex_vat"] = trade.fillna(0).round(2)
-    else:
-        out["cost_ex_vat"] = (out["rrp_ex_vat"] * (1 - disc)).round(2)
-
-    # Backwards compatibility
-    out["rrp_net"] = out["rrp_ex_vat"]
-    out["cost_net"] = out["cost_ex_vat"]
-
-    # -----------------------------------------------------------
-    # Create catalogue_name (Option B)
-    # -----------------------------------------------------------
-    def _safe_upper(val):
-        s = "" if val is None else str(val)
-        s = s.strip()
-        return s.upper() if s else ""
-
-    out["catalogue_name"] = (
-        out["category"].map(_safe_upper)
-        + ", "
-        + out["name"].map(_safe_upper)
-        + " - ("
-        + out["finish"].map(_safe_upper)
-        + ")"
+    # --- Deduplicate manufacturer codes (with report) ---
+    out_deduped, dedupe_report = _dedupe_supplier_codes(
+        out=out,
+        df_source=df,
+        supplier_col=dedupe_by_supplier_column,
+        mode=dedupe_mode,
     )
 
-    # If no category, drop the leading "CATEGORY, "
-    mask_blank_cat = out["category"].astype(str).str.strip() == ""
-    out.loc[mask_blank_cat, "catalogue_name"] = (
-        out["name"].map(_safe_upper)
-        + " - ("
-        + out["finish"].map(_safe_upper)
-        + ")"
-    )
+    cleaned_final = out_deduped[CANONICAL_ORDER].reset_index(drop=True)
 
-    # -----------------------------------------------------------
-    # Deduplicate by supplier + supplier_code
-    # -----------------------------------------------------------
-    out = out.fillna("")
-    out = out.groupby(["supplier", "supplier_code"], as_index=False).first()
-
-    # Final order
-    out = out[CANONICAL_ORDER]
-    return out
+    if return_report:
+        return cleaned_final, dedupe_report
+    return cleaned_final
 
 
-def _extract_dimensions(text):
-    # Ensure text is always a string (handles ints, floats, NaN, None)
-    if text is None:
-        t = ""
+# ---------------------------
+# Helpers
+# ---------------------------
+def _clean_code(x, code_length=None):
+    """
+    Preserve leading zeros.
+    Only pads when code_length is provided (e.g. Hansgrohe 8).
+    Never truncates longer codes.
+    """
+    if x is None:
+        s = ""
     else:
-        t = str(text)
+        try:
+            if isinstance(x, float) and x.is_integer():
+                x = int(x)
+        except Exception:
+            pass
+        s = str(x).strip()
 
+    if not s or s.lower() == "nan":
+        return ""
+
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    if code_length:
+        try:
+            n = int(code_length)
+            if s.isdigit() and len(s) < n:
+                s = s.zfill(n)
+        except Exception:
+            pass
+
+    return s
+
+
+def _extract_dimensions_safe(x):
+    t = "" if x is None else str(x)
     for rgx in DIMENSION_REGEXES:
         m = rgx.search(t)
         if m:
             dims = "x".join(m.groups())
             clean = rgx.sub("", t).strip()
             return _normalise_title(clean), dims
-
     return _normalise_title(t), ""
 
 
 def _normalise_title(t: str) -> str:
-    """Basic title cleanup and title-casing, preserving special tokens."""
-    t = re.sub(r"\s+", " ", t).strip()
-
-    def _tc(word: str) -> str:
-        keep = {"WC", "XL", "LED", "RGB", "2-Tap", "3-Tap"}
-        return word if word.upper() in keep else word.capitalize()
-
-    return " ".join(_tc(w) for w in t.split(" "))
+    t = re.sub(r"\s+", " ", (t or "")).strip()
+    return t
 
 
-def _normalise_finish(f: str) -> str:
-    """Normalise finish names using the FINISH_CANON map."""
-    f2 = f.strip().lower()
-    return FINISH_CANON.get(f2, f.title())
+def _normalise_finish(f):
+    s = "" if f is None else str(f).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    key = s.lower()
+    return FINISH_CANON.get(key, s.title())
 
 
-def _vat_series(series: pd.Series, default: float = 0.2) -> pd.Series:
-    """Normalise VAT column to a numeric rate (e.g. 0.2)."""
-    try:
-        return series.fillna(default).map(lambda x: _parse_vat_value(x, default))
-    except Exception:
-        return pd.Series([default] * len(series))
-
-
-def _parse_vat_value(x, default: float) -> float:
+def _parse_vat(x):
     if x is None:
-        return default
+        return 0.2
     s = str(x).strip()
-    if not s:
-        return default
-    s = s.replace("%", "")
+    if s == "" or s.lower() == "nan":
+        return 0.2
+    s = s.replace("%", "").strip()
     try:
-        val = float(s)
-    except ValueError:
-        return default
-    return val / 100 if val > 1 else val
+        v = float(s)
+        if v > 1:
+            return v / 100.0
+        return v
+    except Exception:
+        return 0.2
+
+
+def _build_catalogue_name(df: pd.DataFrame, out: pd.DataFrame, merge_fields_raw: str, merge_dedupe: bool) -> pd.Series:
+    """
+    If merge_fields_raw provided (comma separated supplier headings),
+    build catalogue_name from those supplier columns.
+
+    For exactly 2 fields (Hansgrohe use-case):
+    -> "SHORT DESCRIPTION - 'COLOUR'" (colour optional; skip if blank)
+
+    For 3+ fields:
+    -> join with ", " (still blank-safe)
+
+    Always uppercases final output.
+    """
+    if merge_fields_raw:
+        fields = [f.strip() for f in merge_fields_raw.split(",") if f.strip()]
+
+        parts = []
+        for f in fields:
+            if f in df.columns:
+                parts.append(df[f].astype(str).fillna("").str.strip())
+            else:
+                parts.append(pd.Series([""] * len(df), index=df.index))
+
+        merged = []
+        for i in range(len(df)):
+            vals = []
+            for s in parts:
+                v = (s.iloc[i] or "").strip()
+                if not v or v.lower() == "nan":
+                    continue
+                vals.append(v)
+
+            if merge_dedupe and len(vals) >= 2:
+                vals = _dedupe_parts(vals)
+
+            if len(vals) == 0:
+                merged.append("")
+            elif len(vals) == 1:
+                merged.append(vals[0])
+            elif len(vals) == 2:
+                merged.append(f"{vals[0]} - '{vals[1]}'")
+            else:
+                merged.append(", ".join(vals))
+
+        return pd.Series(merged, index=df.index).str.upper()
+
+    # fallback
+    base = out.get("name", "").astype(str).fillna("").str.strip()
+    fin = out.get("finish", "").astype(str).fillna("").str.strip()
+
+    merged = []
+    for i in range(len(out)):
+        b = base.iloc[i]
+        f = fin.iloc[i]
+        if b and f:
+            merged.append(f"{b} - ({f})".upper())
+        else:
+            merged.append((b or "").upper())
+    return pd.Series(merged, index=out.index)
+
+
+def _dedupe_parts(vals: list[str]) -> list[str]:
+    cleaned = []
+    for v in vals:
+        v_strip = v.strip()
+        if not v_strip:
+            continue
+        if any(v_strip.lower() == c.lower() for c in cleaned):
+            continue
+        cleaned.append(v_strip)
+
+    if len(cleaned) <= 1:
+        return cleaned
+
+    final = []
+    for v in cleaned:
+        vlow = v.lower()
+        contained = False
+        for other in cleaned:
+            if other is v:
+                continue
+            olow = other.lower()
+            if vlow != olow and vlow in olow:
+                contained = True
+                break
+        if not contained:
+            final.append(v)
+
+    return final
+
+
+def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_col: str, mode: str):
+    """
+    Returns (kept_df, report_df)
+
+    Dedup key:
+      - (supplier, supplier_code) OR (supplier, supplier_code, <supplier_col>)
+    supplier_col example: "Brand"
+
+    Report logs:
+      - key fields
+      - count before
+      - distinct rrps/costs
+      - kept values
+      - kept original row index
+      - reason flags
+    """
+    df = out.copy()
+
+    # Build dedupe key
+    key_cols = ["supplier", "supplier_code"]
+    temp_key_name = None
+
+    if supplier_col and supplier_col in df_source.columns:
+        temp_key_name = "__dedupe_supplier_col__"
+        df[temp_key_name] = df_source[supplier_col].astype(str).fillna("").str.strip()
+        key_cols.append(temp_key_name)
+
+    # If no duplicates, return empty report
+    if not df.duplicated(subset=key_cols, keep=False).any():
+        report = pd.DataFrame(columns=[
+            "supplier", "supplier_code", supplier_col or "group",
+            "duplicate_count", "rrp_values", "cost_values",
+            "kept_rrp", "kept_cost", "kept_source_row",
+            "flag"
+        ])
+        if temp_key_name and temp_key_name in df.columns:
+            df = df.drop(columns=[temp_key_name])
+        return df, report
+
+    # Numeric helper columns
+    df["__rrp_num__"] = pd.to_numeric(df["rrp_net"], errors="coerce").fillna(0.0).round(2)
+    df["__cost_num__"] = pd.to_numeric(df["cost_net"], errors="coerce").fillna(0.0).round(2)
+
+    # Build a per-group summary report FIRST (before dropping rows)
+    grouped = df.groupby(key_cols, dropna=False)
+
+    report_rows = []
+    for key, g in grouped:
+        if len(g) <= 1:
+            continue
+
+        rrps = sorted(g["__rrp_num__"].unique().tolist())
+        costs = sorted(g["__cost_num__"].unique().tolist())
+        price_conflict = (len(rrps) > 1) or (len(costs) > 1)
+
+        # Decide which row to keep
+        if mode == "keep_first":
+            kept_row = g.sort_index().iloc[0]
+        else:
+            kept_row = g.sort_values("__rrp_num__", ascending=False).iloc[0]
+
+        flag = "DUPLICATE_CODE"
+        if price_conflict:
+            flag = "DUPLICATE_CODE_DIFF_PRICE"
+
+        supplier_val = kept_row.get("supplier", "")
+        code_val = kept_row.get("supplier_code", "")
+
+        if temp_key_name:
+            supplier_group_val = kept_row.get(temp_key_name, "")
+        else:
+            supplier_group_val = ""
+
+        report_rows.append({
+            "supplier": supplier_val,
+            "supplier_code": code_val,
+            (supplier_col if supplier_col else "group"): supplier_group_val,
+            "duplicate_count": int(len(g)),
+            "rrp_values": ", ".join([f"{x:.2f}" for x in rrps]),
+            "cost_values": ", ".join([f"{x:.2f}" for x in costs]),
+            "kept_rrp": float(kept_row["__rrp_num__"]),
+            "kept_cost": float(kept_row["__cost_num__"]),
+            "kept_source_row": int(kept_row.name) if str(kept_row.name).isdigit() else str(kept_row.name),
+            "flag": flag,
+        })
+
+    report_df = pd.DataFrame(report_rows)
+
+    # Now keep rows according to mode
+    if mode == "keep_first":
+        kept = df.sort_index().groupby(key_cols, as_index=False).head(1)
+    else:
+        kept = df.sort_values("__rrp_num__", ascending=False).groupby(key_cols, as_index=False).head(1)
+
+    # Append notes flag to kept rows where conflict exists
+    conflict_keys = set(report_df.loc[report_df["flag"] == "DUPLICATE_CODE_DIFF_PRICE", ["supplier", "supplier_code"]].apply(tuple, axis=1).tolist())
+
+    def _append_note(existing: str, note: str) -> str:
+        existing = (existing or "").strip()
+        if not existing:
+            return note
+        if note.lower() in existing.lower():
+            return existing
+        return existing + " | " + note
+
+    kept["notes"] = kept.apply(
+        lambda r: _append_note(r.get("notes", ""), "DUPLICATE_CODE_DIFF_PRICE")
+        if (r.get("supplier", ""), r.get("supplier_code", "")) in conflict_keys
+        else (r.get("notes", "") or ""),
+        axis=1
+    )
+
+    # Cleanup temp/internal cols
+    drop_cols = ["__rrp_num__", "__cost_num__"]
+    if temp_key_name and temp_key_name in kept.columns:
+        drop_cols.append(temp_key_name)
+    kept = kept.drop(columns=[c for c in drop_cols if c in kept.columns])
+
+    return kept, report_df

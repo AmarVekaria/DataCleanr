@@ -76,19 +76,11 @@ async def preview(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
     sheet_name: str = Form(""),
-
-    # how to pick the base name if you don't provide merge_fields
     name_preference: str = Form("auto"),
-
-    # code padding (Hansgrohe codes = 8)
     code_length: int | None = Form(None),
-
-    # retailer-controlled merge recipe for catalogue_name
-    merge_fields: str = Form(""),          # e.g. "Short Description,Colour"
+    merge_fields: str = Form(""),
     merge_dedupe: bool = Form(True),
-
-    # NEW: duplicate control
-    dedupe_by_supplier_column: str = Form("Brand"),  # default for your request
+    dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
     try:
@@ -105,6 +97,7 @@ async def preview(
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
+            "return_report": False,
         }
 
         cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
@@ -125,12 +118,8 @@ async def export(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
-
-    # retailer-controlled merge recipe
     merge_fields: str = Form(""),
     merge_dedupe: bool = Form(True),
-
-    # NEW: duplicate control
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -149,18 +138,21 @@ async def export(
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
+            "return_report": True,
         }
 
-        cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+        cleaned, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
         output = BytesIO()
-        cleaned.to_excel(output, index=False)
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
+            report.to_excel(writer, index=False, sheet_name="Report")
         output.seek(0)
 
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=cleaned.xlsx"},
+            headers={"Content-Disposition": "attachment; filename=cleaned_with_report.xlsx"},
         )
 
     except HTTPException:
@@ -179,11 +171,8 @@ async def export_showroom(
     sheet_name: str = Form(""),
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
-
     merge_fields: str = Form(""),
     merge_dedupe: bool = Form(True),
-
-    # NEW: duplicate control
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
@@ -202,9 +191,10 @@ async def export_showroom(
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
+            "return_report": True,
         }
 
-        canon = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+        canon, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
         showroom_df = to_showroom_schema(
             canon,
@@ -214,13 +204,15 @@ async def export_showroom(
         )
 
         output = BytesIO()
-        showroom_df.to_excel(output, index=False)
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            showroom_df.to_excel(writer, index=False, sheet_name="Upload")
+            report.to_excel(writer, index=False, sheet_name="Report")
         output.seek(0)
 
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=showroom_upload.xlsx"},
+            headers={"Content-Disposition": "attachment; filename=showroom_upload_with_report.xlsx"},
         )
 
     except HTTPException:
