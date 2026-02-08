@@ -76,22 +76,16 @@ def _build_mapping(df: pd.DataFrame, supplier: str) -> dict:
 
 
 def _to_float_series(s: pd.Series) -> pd.Series:
-    """
-    Best-effort numeric extraction from price-like strings.
-    Handles: "£1,234.50", "1234.5", "1234", "1,234"
-    """
     if s is None:
         return pd.Series(dtype="float64")
     x = s.astype(str).fillna("").str.strip()
     x = x.str.replace("£", "", regex=False).str.replace(",", "", regex=False)
-    # extract first number
     extracted = x.str.extract(r"([0-9]+(?:\.[0-9]+)?)", expand=False)
     return pd.to_numeric(extracted, errors="coerce")
 
 
 def _extract_template_columns(merge_template: str) -> list[str]:
     cols = [c.strip() for c in PLACEHOLDER_RE.findall(merge_template or "") if c.strip()]
-    # preserve order, unique
     seen = set()
     out = []
     for c in cols:
@@ -101,29 +95,50 @@ def _extract_template_columns(merge_template: str) -> list[str]:
     return out
 
 
+def _build_duplicate_lookup_from_report(report_df: pd.DataFrame) -> dict:
+    """
+    Builds:
+      {
+        (supplier, supplier_code): kept_source_row_int or None
+      }
+    Only for duplicate groups present in report.
+    """
+    lookup = {}
+    if report_df is None or report_df.empty:
+        return lookup
+
+    # Expect columns from cleaner report:
+    # supplier, supplier_code, kept_source_row, duplicate_count, flag, ...
+    for _, r in report_df.iterrows():
+        supplier = str(r.get("supplier", "")).strip()
+        code = str(r.get("supplier_code", "")).strip()
+        kept = r.get("kept_source_row", None)
+        try:
+            kept = int(kept)
+        except Exception:
+            kept = None
+        if supplier and code:
+            lookup[(supplier, code)] = kept
+    return lookup
+
+
 def _build_diff_sheet(
     df_raw: pd.DataFrame,
     cleaned: pd.DataFrame,
+    report_df: pd.DataFrame,
     mapping: dict,
     merge_template: str,
+    supplier: str,
 ) -> pd.DataFrame:
     """
-    Creates a retailer-friendly diff between raw supplier file and cleaned output.
-    Joins by supplier_code.
+    Diff between raw supplier file and cleaned output with duplicate status.
 
-    Includes:
-      - raw supplier_code (as seen)
-      - cleaned supplier_code
-      - raw template columns (e.g. Short Description, Colour)
-      - cleaned catalogue_name
-      - raw rrp/cost columns if detectable via mapping (rrp_net/cost_net)
-      - cleaned rrp_net/cost_net
-      - changed_fields summary
+    Adds:
+      - duplicate_status: KEPT / REMOVED / NO_DUPLICATE
+      - kept_source_row: raw row index kept for the group (if duplicates)
     """
-    # Identify raw supplier code column (from mapping)
     raw_code_col = mapping.get("supplier_code")
     if not raw_code_col or raw_code_col not in df_raw.columns:
-        # fallback: just use cleaned supplier_code
         raw_codes = pd.Series([""] * len(df_raw))
     else:
         raw_codes = df_raw[raw_code_col]
@@ -131,16 +146,13 @@ def _build_diff_sheet(
     raw_codes_str = raw_codes.astype(str).fillna("").str.strip()
     raw_codes_str = raw_codes_str.str.replace(r"\.0$", "", regex=True)
 
-    # Template columns to show
     template_cols = _extract_template_columns(merge_template)
     raw_template_data = {}
     for c in template_cols:
-        if c in df_raw.columns:
-            raw_template_data[f"raw::{c}"] = df_raw[c].astype(str).fillna("").str.strip()
-        else:
-            raw_template_data[f"raw::{c}"] = ""
+        raw_template_data[f"raw::{c}"] = (
+            df_raw[c].astype(str).fillna("").str.strip() if c in df_raw.columns else ""
+        )
 
-    # Raw price columns (if mapping points to them)
     raw_rrp_col = mapping.get("rrp_net")
     raw_cost_col = mapping.get("cost_net")
 
@@ -148,13 +160,13 @@ def _build_diff_sheet(
     raw_cost = _to_float_series(df_raw[raw_cost_col]) if raw_cost_col in df_raw.columns else pd.Series([None] * len(df_raw))
 
     raw_frame = pd.DataFrame({
+        "raw_row_index": df_raw.index.astype(int),
         "raw_supplier_code": raw_codes_str,
         **raw_template_data,
         "raw_rrp": raw_rrp.round(2),
         "raw_cost": raw_cost.round(2),
     })
 
-    # Cleaned subset
     clean_frame = cleaned.copy()
     clean_frame["clean_supplier_code"] = clean_frame.get("supplier_code", "").astype(str).fillna("").str.strip()
     clean_frame["clean_catalogue_name"] = clean_frame.get("catalogue_name", "").astype(str).fillna("").str.strip()
@@ -166,11 +178,6 @@ def _build_diff_sheet(
         "clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost", "clean_notes"
     ]]
 
-    # Join: raw -> cleaned by supplier code value (best effort)
-    # NOTE: raw codes might not be padded; cleaned codes might be padded.
-    # So we do a dual-join strategy:
-    # - exact match raw_supplier_code == clean_supplier_code
-    # - if not found, try left-pad numeric raw codes to match cleaned length (if cleaned codes seem fixed length)
     df_join = raw_frame.merge(
         clean_frame,
         left_on="raw_supplier_code",
@@ -178,9 +185,8 @@ def _build_diff_sheet(
         how="left",
     )
 
-    # second pass for unmatched rows: pad raw numeric codes to length of first non-empty cleaned code
+    # Second pass: pad raw codes to common cleaned length for matches
     if df_join["clean_supplier_code"].isna().any():
-        # infer common cleaned code length if possible
         non_empty = clean_frame["clean_supplier_code"][clean_frame["clean_supplier_code"] != ""]
         common_len = int(non_empty.str.len().mode().iloc[0]) if len(non_empty) else None
 
@@ -198,40 +204,69 @@ def _build_diff_sheet(
                 how="left",
             )
 
-            # fill only where first join failed
             mask = df_join["clean_supplier_code"].isna()
             for col in ["clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost", "clean_notes"]:
                 df_join.loc[mask, col] = df_join2.loc[mask, col].values
 
+    # Build duplicate lookup
+    dup_lookup = _build_duplicate_lookup_from_report(report_df)
+
+    def _dup_status(row):
+        code = str(row.get("raw_supplier_code", "")).strip()
+        if not code:
+            return "NO_CODE", None
+
+        key = (supplier, code)
+        kept_row = dup_lookup.get(key)
+
+        # If this code is in report => it had duplicates
+        if key in dup_lookup:
+            if kept_row is None:
+                return "DUPLICATE_UNKNOWN", None
+            if int(row.get("raw_row_index")) == kept_row:
+                return "KEPT", kept_row
+            return "REMOVED", kept_row
+
+        # If not in report => no duplicates were detected for that group
+        return "NO_DUPLICATE", None
+
+    statuses = df_join.apply(lambda r: _dup_status(r), axis=1)
+    df_join["duplicate_status"] = [s[0] for s in statuses]
+    df_join["kept_source_row"] = [s[1] for s in statuses]
+
     # Changed fields summary
     def _changed_fields_row(r):
         changes = []
-        # supplier code pad
         if (r.get("raw_supplier_code") or "") != (r.get("clean_supplier_code") or "") and (r.get("clean_supplier_code") not in [None, ""]):
             changes.append("CODE_PADDED/CHANGED")
-        # template-driven text change (only if we have raw template columns)
+
         if template_cols:
             raw_text = " | ".join([(r.get(f"raw::{c}") or "").strip() for c in template_cols]).strip()
             clean_text = (r.get("clean_catalogue_name") or "").strip()
             if raw_text and clean_text and raw_text.upper() != clean_text.upper():
                 changes.append("DESC_BUILT/CHANGED")
-        # price change (only if raw exists)
+
         if pd.notna(r.get("raw_rrp")) and pd.notna(r.get("clean_rrp")):
             if float(r.get("raw_rrp") or 0) != float(r.get("clean_rrp") or 0):
                 changes.append("RRP_CHANGED")
+
         if pd.notna(r.get("raw_cost")) and pd.notna(r.get("clean_cost")):
             if float(r.get("raw_cost") or 0) != float(r.get("clean_cost") or 0):
                 changes.append("COST_CHANGED")
+
         return ", ".join(changes)
 
     df_join["changed_fields"] = df_join.apply(_changed_fields_row, axis=1)
 
-    # Order columns nicely
-    ordered_cols = ["raw_supplier_code"]
+    ordered_cols = ["raw_row_index", "raw_supplier_code"]
     ordered_cols += [f"raw::{c}" for c in template_cols]
-    ordered_cols += ["raw_rrp", "raw_cost", "clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost", "changed_fields", "clean_notes"]
+    ordered_cols += [
+        "raw_rrp", "raw_cost",
+        "clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost",
+        "duplicate_status", "kept_source_row",
+        "changed_fields", "clean_notes"
+    ]
 
-    # Ensure all exist
     for c in ordered_cols:
         if c not in df_join.columns:
             df_join[c] = ""
@@ -300,7 +335,7 @@ async def export(
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
     include_raw_sheet: bool = Form(False),
-    include_diff_sheet: bool = Form(False),  # NEW
+    include_diff_sheet: bool = Form(False),
 ):
     try:
         pref = _validate_name_preference(name_preference)
@@ -325,7 +360,14 @@ async def export(
 
         diff_df = None
         if include_diff_sheet:
-            diff_df = _build_diff_sheet(df_raw=df, cleaned=cleaned, mapping=mapping, merge_template=merge_template)
+            diff_df = _build_diff_sheet(
+                df_raw=df,
+                cleaned=cleaned,
+                report_df=report,
+                mapping=mapping,
+                merge_template=merge_template,
+                supplier=supplier,
+            )
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -368,7 +410,7 @@ async def export_showroom(
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
     include_raw_sheet: bool = Form(False),
-    include_diff_sheet: bool = Form(False),  # NEW
+    include_diff_sheet: bool = Form(False),
 ):
     try:
         pref = _validate_name_preference(name_preference)
@@ -400,8 +442,14 @@ async def export_showroom(
 
         diff_df = None
         if include_diff_sheet:
-            # Diff is between Raw and Canonical (still useful even if Upload differs)
-            diff_df = _build_diff_sheet(df_raw=df, cleaned=canon, mapping=mapping, merge_template=merge_template)
+            diff_df = _build_diff_sheet(
+                df_raw=df,
+                cleaned=canon,
+                report_df=report,
+                mapping=mapping,
+                merge_template=merge_template,
+                supplier=supplier,
+            )
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
