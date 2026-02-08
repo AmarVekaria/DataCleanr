@@ -11,7 +11,6 @@ from core.mappings import infer_column_mapping, get_supplier_override
 from core.exporters import to_showroom_schema
 from core.detectors import suggest_merge_candidates
 
-
 app = FastAPI(title="DataCleanr MVP")
 
 ALLOWED_NAME_PREFS = {"auto", "short_description", "product_title", "full_description"}
@@ -89,6 +88,11 @@ async def preview(
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
 ):
+    """
+    JSON preview only (no download). Returns:
+      - suggestions (recommended merge template)
+      - preview_rows (first 50 cleaned rows)
+    """
     try:
         pref = _validate_name_preference(name_preference)
         mode = _validate_dedupe_mode(dedupe_mode)
@@ -96,7 +100,6 @@ async def preview(
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
 
-        # NEW: suggestions from the raw file headers
         suggestions = suggest_merge_candidates(df)
 
         options = {
@@ -124,12 +127,12 @@ async def preview(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
-@app.post("/preview")
-async def preview(
+@app.post("/export")
+async def export(
     file: UploadFile = File(...),
     supplier: str = Form("unknown"),
+    discount_percent: float = Form(0.0),
     sheet_name: str = Form(""),
-
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
 
@@ -139,7 +142,16 @@ async def preview(
 
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
+
+    # NEW: include original supplier data as Raw sheet
+    include_raw_sheet: bool = Form(False),
 ):
+    """
+    Downloads cleaned Excel:
+      - Raw (optional)
+      - Cleaned
+      - Report (duplicates audit)
+    """
     try:
         pref = _validate_name_preference(name_preference)
         mode = _validate_dedupe_mode(dedupe_mode)
@@ -147,10 +159,8 @@ async def preview(
         df = await _read_any(file, sheet_name=sheet_name)
         mapping = _build_mapping(df, supplier)
 
-        # NEW: suggestions from the raw file headers
-        suggestions = suggest_merge_candidates(df)
-
         options = {
+            "discount_percent": discount_percent,
             "name_preference": pref,
             "code_length": code_length,
             "merge_fields": merge_fields,
@@ -158,15 +168,27 @@ async def preview(
             "merge_dedupe": merge_dedupe,
             "dedupe_by_supplier_column": dedupe_by_supplier_column,
             "dedupe_mode": mode,
-            "return_report": False,
+            "return_report": True,
         }
 
-        cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+        cleaned, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
-        return JSONResponse({
-            "suggestions": suggestions,
-            "preview_rows": cleaned.head(50).to_dict(orient="records"),
-        })
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            if include_raw_sheet:
+                # keep Raw identical to supplier upload (no transformation)
+                df.to_excel(writer, index=False, sheet_name="Raw")
+
+            cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
+            report.to_excel(writer, index=False, sheet_name="Report")
+
+        output.seek(0)
+
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=cleaned_with_report.xlsx"},
+        )
 
     except HTTPException:
         raise
@@ -185,15 +207,22 @@ async def export_showroom(
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
 
-    # description merge (retailer-controlled)
     merge_fields: str = Form(""),
     merge_template: str = Form(""),
     merge_dedupe: bool = Form(True),
 
-    # duplicates
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
+
+    # NEW: include original supplier data as Raw sheet
+    include_raw_sheet: bool = Form(False),
 ):
+    """
+    Downloads Showroom/Intact upload Excel:
+      - Raw (optional)
+      - Upload (schema)
+      - Report (duplicates audit)
+    """
     try:
         pref = _validate_name_preference(name_preference)
         mode = _validate_dedupe_mode(dedupe_mode)
@@ -224,8 +253,12 @@ async def export_showroom(
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            if include_raw_sheet:
+                df.to_excel(writer, index=False, sheet_name="Raw")
+
             showroom_df.to_excel(writer, index=False, sheet_name="Upload")
             report.to_excel(writer, index=False, sheet_name="Report")
+
         output.seek(0)
 
         return StreamingResponse(
