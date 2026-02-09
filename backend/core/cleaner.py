@@ -40,6 +40,9 @@ DIMENSION_REGEXES = [
 PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")  # {Column Heading}
 
 
+# ---------------------------
+# Main
+# ---------------------------
 def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None):
     """
     If options['return_report'] is True -> returns (cleaned_df, report_df)
@@ -51,12 +54,15 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     code_length = options.get("code_length", None)
 
     # Retailer-controlled merge
-    merge_fields_raw = (options.get("merge_fields") or "").strip()         # "Short Description,Colour"
-    merge_template = (options.get("merge_template") or "").strip()         # "{Short Description} - '{Colour}'"
+    merge_fields_raw = (options.get("merge_fields") or "").strip()     # "Short Description,Colour"
+    merge_template = (options.get("merge_template") or "").strip()     # "{Short Description} - '{Colour}'"
     merge_dedupe = bool(options.get("merge_dedupe", True))
 
+    # Name preference (lets retailer choose which description column drives "name"/catalogue)
+    name_preference = (options.get("name_preference") or "auto").strip().lower()  # auto | short_description | product_title | full_description
+
     # Dedup controls
-    dedupe_by_supplier_column = (options.get("dedupe_by_supplier_column") or "").strip()  # Brand
+    dedupe_by_supplier_column = (options.get("dedupe_by_supplier_column") or "").strip()  # Brand (for Hansgrohe)
     dedupe_mode = (options.get("dedupe_mode") or "keep_max_rrp").strip().lower()          # keep_max_rrp | keep_first
 
     return_report = bool(options.get("return_report", False))
@@ -77,9 +83,11 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     supplier_code = _get_series("supplier_code", "")
     out["supplier_code"] = supplier_code.map(lambda x: _clean_code(x, code_length))
 
-    raw_name = _get_series("name", "")
+    # Prefer a chosen description column (if available), otherwise mapping-driven
+    raw_name = _pick_name_series(df=df, mapping=mapping, fallback=_get_series("name", ""), name_preference=name_preference)
     raw_finish = _get_series("finish", "")
 
+    # Name + dimensions
     name_clean, dims = zip(*raw_name.map(_extract_dimensions_safe))
     out["name"] = list(name_clean)
     out["dimensions_mm"] = list(dims)
@@ -92,6 +100,7 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
 
     out["rrp_net"] = rrp.round(2)
 
+    # If no cost column (or all zero) and discount provided -> compute cost from RRP
     if (cost == 0).all() and discount_percent > 0:
         out["cost_net"] = (out["rrp_net"] * (1 - (discount_percent / 100.0))).round(2)
     else:
@@ -103,7 +112,9 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
 
     out["barcode"] = _get_series("barcode", "").astype(str).fillna("").str.strip()
     out["uom"] = _get_series("uom", "each").astype(str).fillna("each").str.strip()
-    out["category"] = _get_series("category", "").astype(str).fillna("").str.strip()
+
+    # IMPORTANT (per your note): leave category blank for retailers to manage however they like
+    out["category"] = ""
 
     # --- catalogue_name (template > fields > fallback) ---
     out["catalogue_name"] = _build_catalogue_name(
@@ -132,11 +143,41 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
 # ---------------------------
 # Helpers
 # ---------------------------
+def _pick_name_series(df: pd.DataFrame, mapping: dict, fallback: pd.Series, name_preference: str) -> pd.Series:
+    """
+    Lets retailer choose which column drives the 'name' field.
+    Works across suppliers by searching case-insensitively for common headings.
+    """
+    if not name_preference or name_preference == "auto":
+        return fallback
+
+    # common choices (case-insensitive lookup)
+    pref_map = {
+        "short_description": ["short description", "shortdescription", "short_desc", "description short"],
+        "product_title": ["product title", "producttitle", "title", "product"],
+        "full_description": ["full description", "fulldescription", "long description", "description", "details"],
+    }
+
+    targets = pref_map.get(name_preference, [])
+    if not targets:
+        return fallback
+
+    # build lookup from normalised col -> real col
+    col_lookup = {str(c).strip().lower(): c for c in df.columns}
+
+    for t in targets:
+        if t in col_lookup:
+            return df[col_lookup[t]].astype(str).fillna("").str.strip()
+
+    return fallback
+
+
 def _clean_code(x, code_length=None):
     """
     Preserve leading zeros.
     Only pads when code_length is provided (e.g. Hansgrohe 8).
     Never truncates longer codes.
+    Only pads numeric-only codes (alphanumeric remain untouched).
     """
     if x is None:
         s = ""
@@ -225,7 +266,6 @@ def _build_catalogue_name(
     if merge_template:
         placeholders = [p.strip() for p in PLACEHOLDER_RE.findall(merge_template) if p.strip()]
 
-        # Pre-load series for each placeholder (missing columns become blanks)
         series_map = {}
         for col in placeholders:
             if col in df.columns:
@@ -235,7 +275,6 @@ def _build_catalogue_name(
 
         merged = []
         for i in range(len(df)):
-            # raw values for dedupe (optional)
             raw_vals = []
             for col in placeholders:
                 v = (series_map[col].iloc[i] or "").strip()
@@ -245,7 +284,6 @@ def _build_catalogue_name(
             if merge_dedupe and len(raw_vals) >= 2:
                 raw_vals = _dedupe_parts(raw_vals)
 
-            # Build rendered string by replacing placeholders with actual values (or "")
             rendered = merge_template
             for col in placeholders:
                 v = (series_map[col].iloc[i] or "").strip()
@@ -253,10 +291,8 @@ def _build_catalogue_name(
                     v = ""
                 rendered = rendered.replace("{" + col + "}", v)
 
-            # Clean up artefacts when optional values are blank:
             rendered = _cleanup_optional_template(rendered)
 
-            # If template resulted in basically empty punctuation, fall back to joined raw_vals
             cleaned = rendered.strip()
             cleaned = cleaned.strip("- ,|")
             if not cleaned:
@@ -293,11 +329,13 @@ def _build_catalogue_name(
             elif len(vals) == 1:
                 merged.append(vals[0])
             elif len(vals) == 2:
+                # Your requested format:
+                # SHORT DESCRIPTION - 'COLOUR'
                 merged.append(f"{vals[0]} - '{vals[1]}'")
             else:
                 merged.append(", ".join(vals))
 
-        return pd.Series(merged, index=df.index).str.upper()
+        return pd.Series(merged, index=df.index).map(_cleanup_optional_template).str.upper()
 
     # 3) Fallback
     base = out.get("name", "").astype(str).fillna("").str.strip()
@@ -308,9 +346,10 @@ def _build_catalogue_name(
         b = base.iloc[i]
         f = fin.iloc[i]
         if b and f:
-            merged.append(f"{b} - ({f})".upper())
+            merged.append(f"{b} - {f}".upper())
         else:
             merged.append((b or "").upper())
+
     return pd.Series(merged, index=out.index)
 
 
@@ -318,31 +357,39 @@ def _cleanup_optional_template(s: str) -> str:
     """
     Removes common artefacts when optional parts are blank, e.g.
       "ABC - ''" -> "ABC"
-      "ABC - '' " -> "ABC"
+      "ABC - ()" -> "ABC"
+      "ABC ()" -> "ABC"
       "ABC - '" -> "ABC"
-      "ABC -  " -> "ABC"
-    Also collapses multiple spaces.
+    Also collapses multiple spaces and trims trailing punctuation.
     """
-    # Remove empty quoted blocks: '' or "" or ' ' or " "
+    if s is None:
+        return ""
+
+    # remove empty quoted tail blocks
     s = re.sub(r"\s*-\s*''\s*$", "", s)
     s = re.sub(r"\s*-\s*\"\"\s*$", "", s)
 
-    # If quotes remain but nothing inside, remove them
-    s = re.sub(r"'\s*'\s*$", "", s)
-    s = re.sub(r"\"\s*\"\s*$", "", s)
+    # remove empty bracket/paren tail blocks
+    s = re.sub(r"\s*-\s*\(\s*\)\s*$", "", s)
+    s = re.sub(r"\s*\(\s*\)\s*$", "", s)
 
-    # Clean stray punctuation at end
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    s = s.rstrip(" -,")
+    # remove trailing "- '", "- \"" if present
+    s = re.sub(r"\s*-\s*['\"]\s*$", "", s)
 
-    # If we end up with "- '" or "- \"" at end, strip again
-    s = re.sub(r"\s*-\s*['\"]\s*$", "", s).strip()
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", str(s)).strip()
+
+    # strip trailing punctuation leftovers
+    s = s.rstrip(" -,|")
 
     return s
 
 
 def _dedupe_parts(vals: list[str]) -> list[str]:
+    """
+    Removes duplicates and also removes parts that are fully contained in another part.
+    Example: ["O-RINGS", "O-RINGS, HG O-RING SEAL 12X2,25MM"] -> keep only the longer one.
+    """
     cleaned = []
     for v in vals:
         v_strip = v.strip()
@@ -417,11 +464,17 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
         if mode == "keep_first":
             kept_row = g.sort_index().iloc[0]
         else:
+            # keep_max_rrp default
             kept_row = g.sort_values("__rrp_num__", ascending=False).iloc[0]
 
         flag = "DUPLICATE_CODE_DIFF_PRICE" if price_conflict else "DUPLICATE_CODE"
-
         group_val = kept_row.get(temp_key_name, "") if temp_key_name else ""
+
+        kept_source_row = kept_row.name
+        try:
+            kept_source_row = int(kept_source_row)
+        except Exception:
+            kept_source_row = str(kept_source_row)
 
         report_rows.append({
             "supplier": kept_row.get("supplier", ""),
@@ -432,7 +485,7 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
             "cost_values": ", ".join([f"{x:.2f}" for x in costs]),
             "kept_rrp": float(kept_row["__rrp_num__"]),
             "kept_cost": float(kept_row["__cost_num__"]),
-            "kept_source_row": int(kept_row.name) if str(kept_row.name).isdigit() else str(kept_row.name),
+            "kept_source_row": kept_source_row,
             "flag": flag,
         })
 
@@ -445,7 +498,13 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
         kept = df.sort_values("__rrp_num__", ascending=False).groupby(key_cols, as_index=False).head(1)
 
     # Flag kept rows in notes if conflict
-    conflict_keys = set(report_df.loc[report_df["flag"] == "DUPLICATE_CODE_DIFF_PRICE", ["supplier", "supplier_code"]].apply(tuple, axis=1).tolist())
+    if not report_df.empty:
+        conflict_keys = set(
+            report_df.loc[report_df["flag"] == "DUPLICATE_CODE_DIFF_PRICE", ["supplier", "supplier_code"]]
+            .apply(tuple, axis=1).tolist()
+        )
+    else:
+        conflict_keys = set()
 
     def _append_note(existing: str, note: str) -> str:
         existing = (existing or "").strip()
