@@ -75,15 +75,6 @@ def _build_mapping(df: pd.DataFrame, supplier: str) -> dict:
     return mapping
 
 
-def _to_float_series(s: pd.Series) -> pd.Series:
-    if s is None:
-        return pd.Series(dtype="float64")
-    x = s.astype(str).fillna("").str.strip()
-    x = x.str.replace("£", "", regex=False).str.replace(",", "", regex=False)
-    extracted = x.str.extract(r"([0-9]+(?:\.[0-9]+)?)", expand=False)
-    return pd.to_numeric(extracted, errors="coerce")
-
-
 def _extract_template_columns(merge_template: str) -> list[str]:
     cols = [c.strip() for c in PLACEHOLDER_RE.findall(merge_template or "") if c.strip()]
     seen = set()
@@ -95,20 +86,20 @@ def _extract_template_columns(merge_template: str) -> list[str]:
     return out
 
 
+def _to_float_series(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(dtype="float64")
+    x = s.astype(str).fillna("").str.strip()
+    x = x.str.replace("£", "", regex=False).str.replace(",", "", regex=False)
+    extracted = x.str.extract(r"([0-9]+(?:\.[0-9]+)?)", expand=False)
+    return pd.to_numeric(extracted, errors="coerce")
+
+
 def _build_duplicate_lookup_from_report(report_df: pd.DataFrame) -> dict:
-    """
-    Builds:
-      {
-        (supplier, supplier_code): kept_source_row_int or None
-      }
-    Only for duplicate groups present in report.
-    """
     lookup = {}
     if report_df is None or report_df.empty:
         return lookup
 
-    # Expect columns from cleaner report:
-    # supplier, supplier_code, kept_source_row, duplicate_count, flag, ...
     for _, r in report_df.iterrows():
         supplier = str(r.get("supplier", "")).strip()
         code = str(r.get("supplier_code", "")).strip()
@@ -130,18 +121,8 @@ def _build_diff_sheet(
     merge_template: str,
     supplier: str,
 ) -> pd.DataFrame:
-    """
-    Diff between raw supplier file and cleaned output with duplicate status.
-
-    Adds:
-      - duplicate_status: KEPT / REMOVED / NO_DUPLICATE
-      - kept_source_row: raw row index kept for the group (if duplicates)
-    """
     raw_code_col = mapping.get("supplier_code")
-    if not raw_code_col or raw_code_col not in df_raw.columns:
-        raw_codes = pd.Series([""] * len(df_raw))
-    else:
-        raw_codes = df_raw[raw_code_col]
+    raw_codes = df_raw[raw_code_col] if (raw_code_col and raw_code_col in df_raw.columns) else pd.Series([""] * len(df_raw))
 
     raw_codes_str = raw_codes.astype(str).fillna("").str.strip()
     raw_codes_str = raw_codes_str.str.replace(r"\.0$", "", regex=True)
@@ -161,6 +142,8 @@ def _build_diff_sheet(
 
     raw_frame = pd.DataFrame({
         "raw_row_index": df_raw.index.astype(int),
+        "source_file": df_raw.get("source_file", ""),
+        "source_sheet": df_raw.get("source_sheet", ""),
         "raw_supplier_code": raw_codes_str,
         **raw_template_data,
         "raw_rrp": raw_rrp.round(2),
@@ -185,30 +168,6 @@ def _build_diff_sheet(
         how="left",
     )
 
-    # Second pass: pad raw codes to common cleaned length for matches
-    if df_join["clean_supplier_code"].isna().any():
-        non_empty = clean_frame["clean_supplier_code"][clean_frame["clean_supplier_code"] != ""]
-        common_len = int(non_empty.str.len().mode().iloc[0]) if len(non_empty) else None
-
-        if common_len:
-            padded = raw_frame["raw_supplier_code"].map(
-                lambda v: v.zfill(common_len) if v.isdigit() and len(v) < common_len else v
-            )
-            raw_frame2 = raw_frame.copy()
-            raw_frame2["raw_supplier_code_padded"] = padded
-
-            df_join2 = raw_frame2.merge(
-                clean_frame,
-                left_on="raw_supplier_code_padded",
-                right_on="clean_supplier_code",
-                how="left",
-            )
-
-            mask = df_join["clean_supplier_code"].isna()
-            for col in ["clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost", "clean_notes"]:
-                df_join.loc[mask, col] = df_join2.loc[mask, col].values
-
-    # Build duplicate lookup
     dup_lookup = _build_duplicate_lookup_from_report(report_df)
 
     def _dup_status(row):
@@ -219,7 +178,6 @@ def _build_diff_sheet(
         key = (supplier, code)
         kept_row = dup_lookup.get(key)
 
-        # If this code is in report => it had duplicates
         if key in dup_lookup:
             if kept_row is None:
                 return "DUPLICATE_UNKNOWN", None
@@ -227,14 +185,12 @@ def _build_diff_sheet(
                 return "KEPT", kept_row
             return "REMOVED", kept_row
 
-        # If not in report => no duplicates were detected for that group
         return "NO_DUPLICATE", None
 
     statuses = df_join.apply(lambda r: _dup_status(r), axis=1)
     df_join["duplicate_status"] = [s[0] for s in statuses]
     df_join["kept_source_row"] = [s[1] for s in statuses]
 
-    # Changed fields summary
     def _changed_fields_row(r):
         changes = []
         if (r.get("raw_supplier_code") or "") != (r.get("clean_supplier_code") or "") and (r.get("clean_supplier_code") not in [None, ""]):
@@ -258,15 +214,14 @@ def _build_diff_sheet(
 
     df_join["changed_fields"] = df_join.apply(_changed_fields_row, axis=1)
 
-    ordered_cols = ["raw_row_index", "raw_supplier_code"]
-    ordered_cols += [f"raw::{c}" for c in template_cols]
-    ordered_cols += [
+    ordered_cols = [
+        "raw_row_index", "source_file", "source_sheet", "raw_supplier_code",
+        *[f"raw::{c}" for c in template_cols],
         "raw_rrp", "raw_cost",
         "clean_supplier_code", "clean_catalogue_name", "clean_rrp", "clean_cost",
         "duplicate_status", "kept_source_row",
         "changed_fields", "clean_notes"
     ]
-
     for c in ordered_cols:
         if c not in df_join.columns:
             df_join[c] = ""
@@ -274,6 +229,9 @@ def _build_diff_sheet(
     return df_join[ordered_cols]
 
 
+# ---------------------------
+# Preview (unchanged)
+# ---------------------------
 @app.post("/preview")
 async def preview(
     file: UploadFile = File(...),
@@ -321,6 +279,9 @@ async def preview(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
+# ---------------------------
+# Single-file export (kept)
+# ---------------------------
 @app.post("/export")
 async def export(
     file: UploadFile = File(...),
@@ -342,6 +303,11 @@ async def export(
         mode = _validate_dedupe_mode(dedupe_mode)
 
         df = await _read_any(file, sheet_name=sheet_name)
+        df = df.copy()
+        df["source_file"] = file.filename or ""
+        df["source_sheet"] = sheet_name or ""
+        df.index = range(len(df))  # stabilise row ids
+
         mapping = _build_mapping(df, supplier)
 
         options = {
@@ -360,14 +326,7 @@ async def export(
 
         diff_df = None
         if include_diff_sheet:
-            diff_df = _build_diff_sheet(
-                df_raw=df,
-                cleaned=cleaned,
-                report_df=report,
-                mapping=mapping,
-                merge_template=merge_template,
-                supplier=supplier,
-            )
+            diff_df = _build_diff_sheet(df, cleaned, report, mapping, merge_template, supplier)
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -376,12 +335,10 @@ async def export(
 
             cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
             report.to_excel(writer, index=False, sheet_name="Report")
-
             if diff_df is not None:
                 diff_df.to_excel(writer, index=False, sheet_name="Diff")
 
         output.seek(0)
-
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -395,28 +352,141 @@ async def export(
         raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
 
 
-@app.post("/export-showroom")
-async def export_showroom(
-    file: UploadFile = File(...),
+# ---------------------------
+# ✅ NEW: Combine 2 files -> Canonical Clean
+# ---------------------------
+@app.post("/export-combine")
+async def export_combine(
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
     supplier: str = Form("unknown"),
     discount_percent: float = Form(0.0),
-    valid_from: str = Form(""),
-    sheet_name: str = Form(""),
+
+    sheet_name1: str = Form(""),
+    sheet_name2: str = Form(""),
+
     name_preference: str = Form("auto"),
     code_length: int | None = Form(None),
+
     merge_fields: str = Form(""),
     merge_template: str = Form(""),
+
     merge_dedupe: bool = Form(True),
     dedupe_by_supplier_column: str = Form("Brand"),
     dedupe_mode: str = Form("keep_max_rrp"),
-    include_raw_sheet: bool = Form(False),
-    include_diff_sheet: bool = Form(False),
+
+    include_raw_sheet: bool = Form(True),   # for combine, default TRUE is helpful
+    include_diff_sheet: bool = Form(True),  # for combine, default TRUE is helpful
 ):
     try:
         pref = _validate_name_preference(name_preference)
         mode = _validate_dedupe_mode(dedupe_mode)
 
-        df = await _read_any(file, sheet_name=sheet_name)
+        df1 = await _read_any(file1, sheet_name=sheet_name1)
+        df2 = await _read_any(file2, sheet_name=sheet_name2)
+
+        df1 = df1.copy()
+        df2 = df2.copy()
+
+        df1["source_file"] = file1.filename or "file1"
+        df2["source_file"] = file2.filename or "file2"
+        df1["source_sheet"] = sheet_name1 or ""
+        df2["source_sheet"] = sheet_name2 or ""
+
+        df = pd.concat([df1, df2], ignore_index=True)
+        df.index = range(len(df))  # critical for duplicate kept_source_row mapping
+
+        mapping = _build_mapping(df, supplier)
+
+        options = {
+            "discount_percent": discount_percent,
+            "name_preference": pref,
+            "code_length": code_length,
+            "merge_fields": merge_fields,
+            "merge_template": merge_template,
+            "merge_dedupe": merge_dedupe,
+            "dedupe_by_supplier_column": dedupe_by_supplier_column,
+            "dedupe_mode": mode,
+            "return_report": True,
+        }
+
+        cleaned, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+
+        diff_df = None
+        if include_diff_sheet:
+            diff_df = _build_diff_sheet(df, cleaned, report, mapping, merge_template, supplier)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            if include_raw_sheet:
+                df.to_excel(writer, index=False, sheet_name="RawCombined")
+
+            cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
+            report.to_excel(writer, index=False, sheet_name="Report")
+
+            if diff_df is not None:
+                diff_df.to_excel(writer, index=False, sheet_name="Diff")
+
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=combined_cleaned_with_report.xlsx"},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=400, detail=f"{e}\n\n{tb}")
+
+
+# ---------------------------
+# ✅ NEW: Combine 2 files -> Showroom/Intact Upload
+# ---------------------------
+@app.post("/export-showroom-combine")
+async def export_showroom_combine(
+    file1: UploadFile = File(...),
+    file2: UploadFile = File(...),
+
+    supplier: str = Form("unknown"),
+    discount_percent: float = Form(0.0),
+    valid_from: str = Form(""),
+
+    sheet_name1: str = Form(""),
+    sheet_name2: str = Form(""),
+
+    name_preference: str = Form("auto"),
+    code_length: int | None = Form(None),
+
+    merge_fields: str = Form(""),
+    merge_template: str = Form(""),
+
+    merge_dedupe: bool = Form(True),
+    dedupe_by_supplier_column: str = Form("Brand"),
+    dedupe_mode: str = Form("keep_max_rrp"),
+
+    include_raw_sheet: bool = Form(True),
+    include_diff_sheet: bool = Form(True),
+):
+    try:
+        pref = _validate_name_preference(name_preference)
+        mode = _validate_dedupe_mode(dedupe_mode)
+
+        df1 = await _read_any(file1, sheet_name=sheet_name1)
+        df2 = await _read_any(file2, sheet_name=sheet_name2)
+
+        df1 = df1.copy()
+        df2 = df2.copy()
+
+        df1["source_file"] = file1.filename or "file1"
+        df2["source_file"] = file2.filename or "file2"
+        df1["source_sheet"] = sheet_name1 or ""
+        df2["source_sheet"] = sheet_name2 or ""
+
+        df = pd.concat([df1, df2], ignore_index=True)
+        df.index = range(len(df))
+
         mapping = _build_mapping(df, supplier)
 
         options = {
@@ -433,7 +503,7 @@ async def export_showroom(
 
         canon, report = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
-        showroom_df = to_showroom_schema(
+        upload_df = to_showroom_schema(
             canon,
             supplier=supplier,
             discount_percent=discount_percent,
@@ -442,32 +512,24 @@ async def export_showroom(
 
         diff_df = None
         if include_diff_sheet:
-            diff_df = _build_diff_sheet(
-                df_raw=df,
-                cleaned=canon,
-                report_df=report,
-                mapping=mapping,
-                merge_template=merge_template,
-                supplier=supplier,
-            )
+            diff_df = _build_diff_sheet(df, canon, report, mapping, merge_template, supplier)
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             if include_raw_sheet:
-                df.to_excel(writer, index=False, sheet_name="Raw")
+                df.to_excel(writer, index=False, sheet_name="RawCombined")
 
-            showroom_df.to_excel(writer, index=False, sheet_name="Upload")
+            upload_df.to_excel(writer, index=False, sheet_name="Upload")
             report.to_excel(writer, index=False, sheet_name="Report")
 
             if diff_df is not None:
                 diff_df.to_excel(writer, index=False, sheet_name="Diff")
 
         output.seek(0)
-
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=showroom_upload_with_report.xlsx"},
+            headers={"Content-Disposition": "attachment; filename=combined_showroom_upload_with_report.xlsx"},
         )
 
     except HTTPException:
