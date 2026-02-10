@@ -1,8 +1,8 @@
 # backend/core/mappings.py
 
+import re
 from difflib import get_close_matches
 
-# Canonical column names for our cleaned output
 CANONICAL = [
     "supplier",
     "supplier_code",
@@ -11,9 +11,9 @@ CANONICAL = [
     "finish",
     "dimensions_mm",
     "category",
-    "catalogue_name",
     "cost_net",
     "rrp_net",
+    "rrp_gross",
     "vat_rate",
     "uom",
     "pack_size",
@@ -21,93 +21,180 @@ CANONICAL = [
     "notes",
 ]
 
-# Common alternative header names from suppliers
-ALIASES = {}
-ALIASES.update({
-    "supplier_code": ALIASES.get("supplier_code", []) + [
-        "material", "material no", "material number",
-        "product no", "product number", "product code",
-        "item", "item no", "article", "article no",
-        "part no", "part number", "mpn", "model", "sku"
+ALIASES = {
+    "supplier": ["brand", "manufacturer"],
+    "supplier_code": [
+        "code", "item_code", "item code", "product code", "product no", "product number",
+        "product no.", "mpn", "manufacturer product code", "manufacturerproductcode",
+        "manufacturerproduct", "manufacturerproductcode", "manufacturerproductcode",
+        "manufacturerproductcode", "manufacturer productcode", "supplier product code"
     ],
-    "name": ALIASES.get("name", []) + [
-        "product title", "short description", "full description", "title"
-    ],
-    "finish": ALIASES.get("finish", []) + ["colour", "color", "finish"],
-    "rrp_net": ALIASES.get("rrp_net", []) + [
-        "price", "list price", "rrp", "retail price", "unit price"
-    ],
-    "barcode": ALIASES.get("barcode", []) + ["ean", "gtin", "barcode", "upc"],
-    "category": ALIASES.get("category", []) + ["technical class", "line", "range", "class"],
-})
+    "name": ["description", "short description", "product title", "full description", "title", "desc"],
+    "finish": ["colour", "color", "finish/colour", "surface"],
+    "cost_net": ["cost", "net_cost", "net", "buy price", "trade", "trade price", "dealer price"],
 
+    # Net / Ex-VAT RRP synonyms (including “MRP”)
+    "rrp_net": [
+        "rrp ex vat", "rrp ex-vat", "rrp net", "list price ex vat", "list price ex-vat",
+        "mrp", "m.r.p", "net rrp", "net list", "net price", "ex vat", "ex-vat"
+    ],
+
+    # Gross / Inc-VAT RRP synonyms (IMPORTANT: include plain "rrp")
+    "rrp_gross": [
+        "rrp", "rrp inc vat", "rrp inc-vat", "rrp gross", "list price inc vat", "list price inc-vat",
+        "gross rrp", "gross list", "gross price", "inc vat", "inc-vat"
+    ],
+
+    "vat_rate": ["vat", "tax", "vat%", "vat rate", "tax rate"],
+    "barcode": ["ean", "upc", "barcode", "gtin"],
+    "uom": ["unit", "uom", "selling unit", "purchase unit"],
+}
+
+
+# ---------- normalisation helpers ----------
+def normalise_header(h: str) -> str:
+    h = str(h or "").strip().lower()
+    h = re.sub(r"\s+", " ", h)
+    return h
+
+
+def _has_any(h_norm: str, tokens: list[str]) -> bool:
+    return any(t in h_norm for t in tokens)
+
+
+def looks_like_month_price(h: str) -> bool:
+    """
+    Catches:
+      "Feb MRP", "February RRP", "Mar-24 RRP", "FEB-2026 MRP", "Feb_26 RRP"
+    """
+    hh = normalise_header(h)
+
+    months = ["jan", "january", "feb", "february", "mar", "march", "apr", "april",
+              "may", "jun", "june", "jul", "july", "aug", "august", "sep", "sept",
+              "september", "oct", "october", "nov", "november", "dec", "december"]
+
+    # month at start: "feb ..." or "feb-26 ..." or "feb_26 ..."
+    if any(hh.startswith(m + " ") for m in months):
+        return True
+    if any(hh.startswith(m + "-") for m in months):
+        return True
+    if any(hh.startswith(m + "_") for m in months):
+        return True
+
+    # month appears with a year marker: "feb 2026", "mar-24"
+    if re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[\s\-_]?\d{2,4}\b", hh):
+        return True
+
+    return False
+
+
+# ---------- main mapping ----------
 def infer_column_mapping(columns):
     """
-    Given the raw DataFrame columns, build a mapping from our canonical names
-    to the supplier's actual column names.
+    Returns mapping from canonical key -> original column name.
+    Explicitly supports:
+      - rrp_net (ex VAT): MRP preferred
+      - rrp_gross (inc VAT): RRP preferred
     """
-    mapping = {}
-    cols_normalised = [str(c).strip().lower() for c in columns]
 
-    for target in CANONICAL:
-        candidates = [target] + ALIASES.get(target, [])
-        best = _first_match(cols_normalised, candidates)
-        if best is not None:
-            original_name = columns[cols_normalised.index(best)]
-            mapping[target] = original_name
+    mapping = {}
+    cols_norm = [normalise_header(c) for c in columns]
+    norm_to_real = {cols_norm[i]: columns[i] for i in range(len(columns))}
+
+    def pick_best(target_key: str):
+        candidates = [target_key] + ALIASES.get(target_key, [])
+        best = None
+
+        # Special logic for rrp_net / rrp_gross (handles "Feb MRP" / "Feb RRP")
+        if target_key in ("rrp_net", "rrp_gross"):
+            month_cols = [c for c in columns if looks_like_month_price(c)]
+            if month_cols:
+                # Rank month cols with strong rules first
+                for c in month_cols:
+                    cn = normalise_header(c)
+
+                    if target_key == "rrp_net":
+                        # Prefer MRP strongly (your convention: net)
+                        if re.search(r"\b(mrp|m\.r\.p)\b", cn):
+                            return c
+                        # Explicit net/ex-vat also indicates net
+                        if _has_any(cn, ["ex vat", "ex-vat", "net"]):
+                            return c
+
+                    if target_key == "rrp_gross":
+                        # Explicit inc-vat/gross indicates gross
+                        if _has_any(cn, ["inc vat", "inc-vat", "gross"]):
+                            return c
+                        # Month + RRP (common gross)
+                        if re.search(r"\brrp\b", cn):
+                            return c
+
+            # If no month columns, still prioritise MRP vs RRP anywhere
+            all_cols = list(columns)
+            if target_key == "rrp_net":
+                for c in all_cols:
+                    cn = normalise_header(c)
+                    if re.search(r"\b(mrp|m\.r\.p)\b", cn):
+                        return c
+                    if _has_any(cn, ["rrp ex vat", "rrp ex-vat", "net rrp", "ex vat", "ex-vat", "net"]):
+                        return c
+
+            if target_key == "rrp_gross":
+                for c in all_cols:
+                    cn = normalise_header(c)
+                    if _has_any(cn, ["rrp inc vat", "rrp inc-vat", "inc vat", "inc-vat", "gross"]):
+                        return c
+                    # plain RRP (but do NOT steal from a net column if it contains MRP)
+                    if re.search(r"\brrp\b", cn) and not re.search(r"\b(mrp|m\.r\.p)\b", cn):
+                        return c
+
+        # Exact match
+        for cand in candidates:
+            cand_norm = normalise_header(cand)
+            for c_norm in cols_norm:
+                if cand_norm == c_norm:
+                    return norm_to_real[c_norm]
+
+        # contains-style matching
+        for cand in candidates:
+            cand_norm = normalise_header(cand)
+            for c_norm in cols_norm:
+                if cand_norm and cand_norm in c_norm:
+                    best = norm_to_real[c_norm]
+                    break
+            if best:
+                break
+
+        # fuzzy last resort
+        if not best:
+            base = candidates[0]
+            matches = get_close_matches(normalise_header(base), cols_norm, n=1, cutoff=0.83)
+            if matches:
+                best = norm_to_real[matches[0]]
+
+        return best
+
+    for key in CANONICAL:
+        col = pick_best(key)
+        if col:
+            mapping[key] = col
+
+    # Safety: avoid mapping the same source column to both rrp_net and rrp_gross when possible
+    if mapping.get("rrp_net") and mapping.get("rrp_gross") and mapping["rrp_net"] == mapping["rrp_gross"]:
+        # If the chosen column contains MRP -> keep as net, drop gross
+        cn = normalise_header(mapping["rrp_net"])
+        if re.search(r"\b(mrp|m\.r\.p)\b", cn):
+            mapping.pop("rrp_gross", None)
+        else:
+            # otherwise keep gross, drop net
+            mapping.pop("rrp_net", None)
 
     return mapping
 
 
-def _first_match(cols_normalised, candidates):
-    """
-    Find the best matching column name for any of the candidate phrases.
-
-    1) Try exact matches (case-insensitive).
-    2) Then try fuzzy matches for each candidate phrase.
-    """
-    # 1) Exact / contains match
-    for cand in candidates:
-        cand_norm = cand.strip().lower()
-        if cand_norm in cols_normalised:
-            return cand_norm
-
-    # 2) Fuzzy match: try each candidate phrase against all columns
-    for cand in candidates:
-        cand_norm = cand.strip().lower()
-        matches = get_close_matches(cand_norm, cols_normalised, n=1, cutoff=0.8)
-        if matches:
-            return matches[0]
-
-    return None
-
-# ---- Supplier-specific overrides -------------------------------------------
-
-SUPPLIER_OVERRIDES = {
-    # Samuel Heath price list
-    "samuel heath": {
-        "supplier_code": "Product No.",
-        "name": "Description",
-        "finish": "Finish",
-        "category": "Range",
-        "rrp_net": "List Price GBP 20",
-    }
-}
-
-
 def get_supplier_override(supplier: str) -> dict:
-    """Return a mapping override for a given supplier, if we have one.
-
-    Uses case-insensitive match and also accepts names that start with
-    the known supplier key (e.g. "samuel heath jan26 list").
     """
-    if not supplier:
-        return {}
-    key = supplier.strip().lower()
-
-    for s_key, override in SUPPLIER_OVERRIDES.items():
-        if key == s_key or key.startswith(s_key):
-            return override
-
+    Optional hard overrides for specific suppliers.
+    Keep empty for now or add later.
+    """
     return {}
-
