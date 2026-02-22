@@ -13,9 +13,6 @@ from core.discounts import load_discount_rules
 app = FastAPI(title="DataCleanr MVP")
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
 def _apply_mapping_overrides(mapping: dict, supplier: str) -> dict:
     override = get_supplier_override(supplier)
     if override:
@@ -26,18 +23,8 @@ def _apply_mapping_overrides(mapping: dict, supplier: str) -> dict:
 async def _read_any(
     upload: UploadFile,
     sheet_mode: str = "first",   # first | all | named
-    sheet_name: str = "",        # used when sheet_mode="named"
+    sheet_name: str = "",
 ) -> pd.DataFrame:
-    """
-    Reads CSV or Excel into a DataFrame.
-
-    Excel options:
-      - sheet_mode="first": first worksheet only
-      - sheet_mode="all": read all sheets and concatenate
-      - sheet_mode="named": read a specific sheet_name
-
-    Adds __sheet_name column when reading Excel.
-    """
     filename = (upload.filename or "").lower()
 
     if filename.endswith(".csv"):
@@ -45,20 +32,14 @@ async def _read_any(
         df["__sheet_name"] = "CSV"
         return df
 
-    # Excel
     sheet_mode = (sheet_mode or "first").strip().lower()
 
-    if sheet_mode == "named":
-        if not sheet_name.strip():
-            # fallback to first if user didn't supply sheet_name
-            sheet_mode = "first"
-        else:
-            df = pd.read_excel(upload.file, sheet_name=sheet_name)
-            df["__sheet_name"] = sheet_name
-            return df
+    if sheet_mode == "named" and sheet_name.strip():
+        df = pd.read_excel(upload.file, sheet_name=sheet_name)
+        df["__sheet_name"] = sheet_name
+        return df
 
     if sheet_mode == "all":
-        # read all sheets
         all_sheets = pd.read_excel(upload.file, sheet_name=None)
         frames = []
         for sname, sdf in all_sheets.items():
@@ -71,15 +52,11 @@ async def _read_any(
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
 
-    # default: first sheet
     df = pd.read_excel(upload.file, sheet_name=0)
     df["__sheet_name"] = "Sheet1"
     return df
 
 
-# ---------------------------
-# Preview endpoint (JSON)
-# ---------------------------
 @app.post("/preview")
 async def preview(
     file: UploadFile = File(...),
@@ -93,14 +70,9 @@ async def preview(
     mapping = _apply_mapping_overrides(mapping, supplier)
 
     cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping)
-
     return JSONResponse(cleaned.head(50).to_dict(orient="records"))
 
 
-# ---------------------------
-# Canonical export (download cleaned.xlsx)
-# Optional: discount_rules.xlsx -> adds DiscountDebug sheet
-# ---------------------------
 @app.post("/export")
 async def export(
     file: UploadFile = File(...),
@@ -108,11 +80,9 @@ async def export(
     supplier: str = Form("unknown"),
     discount_percent: float = Form(0.0),
 
-    # NEW: sheet controls
-    sheet_mode: str = Form("first"),   # first | all | named
+    sheet_mode: str = Form("first"),
     sheet_name: str = Form(""),
 
-    # existing controls
     code_length: int = Form(0),
     merge_fields: str = Form(""),
     merge_template: str = Form(""),
@@ -133,6 +103,7 @@ async def export(
         "merge_dedupe": bool(merge_dedupe),
         "dedupe_by_supplier_column": dedupe_by_supplier_column,
         "dedupe_mode": dedupe_mode,
+        "return_report": True,
     }
 
     used_rules = False
@@ -141,13 +112,15 @@ async def export(
         options["discount_rules_df"] = rules_df
         used_rules = True
 
-    cleaned = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+    cleaned, report_df = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
 
-        # Optional debug sheet when discount rules are used
+        if isinstance(report_df, pd.DataFrame) and not report_df.empty:
+            report_df.to_excel(writer, index=False, sheet_name="Errors")
+
         if used_rules:
             debug_cols = ["supplier", "supplier_code", "rrp_net", "cost_net", "category", "catalogue_name", "notes"]
             debug_cols = [c for c in debug_cols if c in cleaned.columns]
@@ -162,10 +135,6 @@ async def export(
     )
 
 
-# ---------------------------
-# Showroom / Intact export (download showroom_upload.xlsx)
-# Optional: discount_rules.xlsx supported (canon stage)
-# ---------------------------
 @app.post("/export-showroom")
 async def export_showroom(
     file: UploadFile = File(...),
@@ -174,11 +143,9 @@ async def export_showroom(
     discount_percent: float = Form(0.0),
     valid_from: str = Form(""),
 
-    # NEW: sheet controls
-    sheet_mode: str = Form("first"),   # first | all | named
+    sheet_mode: str = Form("first"),
     sheet_name: str = Form(""),
 
-    # existing controls
     code_length: int = Form(0),
     merge_fields: str = Form(""),
     merge_template: str = Form(""),
@@ -199,13 +166,14 @@ async def export_showroom(
         "merge_dedupe": bool(merge_dedupe),
         "dedupe_by_supplier_column": dedupe_by_supplier_column,
         "dedupe_mode": dedupe_mode,
+        "return_report": True,
     }
 
     if discount_rules is not None:
         rules_df = load_discount_rules(discount_rules.file)
         options["discount_rules_df"] = rules_df
 
-    canon = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
+    canon, report_df = clean_dataframe(df, supplier=supplier, mapping=mapping, options=options)
 
     showroom_df = to_showroom_schema(
         canon,
@@ -215,7 +183,11 @@ async def export_showroom(
     )
 
     output = BytesIO()
-    showroom_df.to_excel(output, index=False)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        showroom_df.to_excel(writer, index=False, sheet_name="ShowroomUpload")
+        if isinstance(report_df, pd.DataFrame) and not report_df.empty:
+            report_df.to_excel(writer, index=False, sheet_name="Errors")
+
     output.seek(0)
 
     return StreamingResponse(
