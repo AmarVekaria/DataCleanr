@@ -39,6 +39,8 @@ DIMENSION_REGEXES = [
 
 PLACEHOLDER_RE = re.compile(r"\{([^}]+)\}")  # {Column Heading}
 
+SEPARATOR_RE = re.compile(r"^[-=_\s]{3,}$")
+
 
 def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dict | None = None):
     """
@@ -76,11 +78,29 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
         return pd.Series([default] * len(df), index=df.index)
 
     # ---------------------------
+    # Report helper
+    # ---------------------------
+    report_rows = []
+    supplier_code_raw = _get_series("supplier_code", "")
+
+    def _add_report(idx, issue: str, severity: str = "ERROR"):
+        row = {
+            "source_row": int(idx) if str(idx).isdigit() else str(idx),
+            "severity": severity,
+            "issue": issue,
+            "supplier_code_raw": str(supplier_code_raw.loc[idx]) if idx in supplier_code_raw.index else "",
+            "supplier_code_clean": str(out.loc[idx, "supplier_code"]) if idx in out.index else "",
+            "name": str(out.loc[idx, "name"]) if idx in out.index else "",
+            "rrp_net": float(out.loc[idx, "rrp_net"]) if idx in out.index else 0.0,
+            "cost_net": float(out.loc[idx, "cost_net"]) if idx in out.index else 0.0,
+        }
+        report_rows.append(row)
+
+    # ---------------------------
     # Basics
     # ---------------------------
     out["supplier"] = supplier
 
-    supplier_code_raw = _get_series("supplier_code", "")
     out["supplier_code"] = supplier_code_raw.map(lambda x: _clean_code(x, code_length))
 
     raw_name = _get_series("name", "")
@@ -93,13 +113,13 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     out["finish"] = raw_finish.map(_normalise_finish)
 
     # ---------------------------
-    # Prices
+    # Prices (RRP + Cost)
     # ---------------------------
     rrp = _get_series("rrp_net", 0).map(to_float).fillna(0.0).round(2)
     cost = _get_series("cost_net", 0).map(to_float).fillna(0.0).round(2)
 
     out["rrp_net"] = rrp
-    out["cost_net"] = cost  # may be overwritten
+    out["cost_net"] = cost
 
     # VAT
     vat = _get_series("vat_rate", 0.2)
@@ -122,31 +142,30 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
     )
 
     # ---------------------------
-    # Build report base (exclusions + warnings)
+    # EXCLUDE non-product rows (blank codes + section headers + separators)
     # ---------------------------
-    report_rows = []
+    code_series = out["supplier_code"].astype(str).fillna("").str.strip()
+    rrp_series = pd.to_numeric(out["rrp_net"], errors="coerce").fillna(0.0)
 
-    def _add_report(idx, issue: str, severity: str = "ERROR"):
-        row = {
-            "source_row": int(idx) if str(idx).isdigit() else str(idx),
-            "severity": severity,
-            "issue": issue,
-            "supplier_code_raw": str(supplier_code_raw.loc[idx]) if idx in supplier_code_raw.index else "",
-            "supplier_code_clean": str(out.loc[idx, "supplier_code"]) if idx in out.index else "",
-            "name": str(out.loc[idx, "name"]) if idx in out.index else "",
-            "rrp_net": float(out.loc[idx, "rrp_net"]) if idx in out.index else 0.0,
-            "cost_net": float(out.loc[idx, "cost_net"]) if idx in out.index else 0.0,
-        }
-        report_rows.append(row)
+    blank_code_mask = code_series.eq("") | code_series.str.lower().eq("nan")
 
-    # Mark blank/invalid code rows (likely section headers / breaks)
-    blank_code_mask = out["supplier_code"].astype(str).str.strip().eq("")
-    if blank_code_mask.any():
-        for idx in out.index[blank_code_mask]:
-            _add_report(idx, "Excluded row: missing supplier_code (likely section header/break row)", "INFO")
+    # Section header heuristic:
+    # - looks like words (few digits) OR separator line
+    # - and has no real price (rrp == 0) to avoid excluding legit codes
+    section_like_mask = code_series.map(_looks_like_section_header) & (rrp_series == 0)
 
-    # Now remove them
-    out = out[~blank_code_mask].copy()
+    exclude_mask = blank_code_mask | section_like_mask
+
+    if exclude_mask.any():
+        for idx in out.index[exclude_mask]:
+            if blank_code_mask.loc[idx]:
+                _add_report(idx, "Excluded row: missing supplier_code (likely break row)", "INFO")
+            else:
+                _add_report(idx, "Excluded row: section header/separator (non-product row)", "INFO")
+
+    out = out[~exclude_mask].copy()
+
+    # Keep df subset aligned for discount rules matching if needed
     df_for_rules = df.loc[out.index] if len(out.index) else df.iloc[0:0]
 
     # ---------------------------
@@ -164,7 +183,6 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
             for idx, row in out.iterrows():
                 rrp_val = float(row.get("rrp_net", 0) or 0)
 
-                # keep existing cost if present
                 if not cost_missing.loc[idx]:
                     computed_costs.append(float(row.get("cost_net", 0) or 0))
                     notes.append(str(row.get("notes", "") or ""))
@@ -192,7 +210,7 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
                     out.loc[cost_missing, "rrp_net"] * (1 - discount_percent / 100.0)
                 ).round(2)
 
-    # Missing RRP warnings (after mapping)
+    # Missing RRP warnings
     if len(out.index):
         missing_rrp = (pd.to_numeric(out["rrp_net"], errors="coerce").fillna(0) == 0)
         if missing_rrp.any():
@@ -201,7 +219,6 @@ def clean_dataframe(df: pd.DataFrame, supplier: str, mapping: dict, options: dic
 
     # ---------------------------
     # Deduplicate duplicate supplier codes (optional)
-    # Adds note when price conflicts
     # ---------------------------
     if len(out.index):
         out = _dedupe_supplier_codes(
@@ -267,6 +284,43 @@ def _clean_code(x, code_length=None):
     return s
 
 
+def _looks_like_section_header(code: str) -> bool:
+    """
+    Generic 'section header' detector for supplier_code column.
+    Designed to be safe for real alphanumeric product codes.
+    """
+    s = (code or "").strip()
+    if not s:
+        return True
+
+    if SEPARATOR_RE.match(s):
+        return True
+
+    # Too many spaces for a code (often phrases like "TOWEL RAILS")
+    if s.count(" ") >= 2 and len(s) <= 40:
+        # If it has very few digits, it's likely a header
+        digits = sum(ch.isdigit() for ch in s)
+        if digits <= 1:
+            return True
+
+    # Mostly letters (headers) and very few digits
+    digits = sum(ch.isdigit() for ch in s)
+    letters = sum(ch.isalpha() for ch in s)
+
+    if letters >= 4 and digits == 0 and len(s) <= 35:
+        # common for ALL CAPS headers
+        return True
+
+    # single-word header like "SHOWERS" / "BRASSWARE"
+    if " " not in s and digits == 0 and letters >= 5 and len(s) <= 25:
+        # Avoid excluding real codes like "AXOR" (short brand-like codes)
+        # If it's all caps and longer, it's very likely a header.
+        if s.isupper() and len(s) >= 6:
+            return True
+
+    return False
+
+
 def _extract_dimensions_safe(x):
     t = "" if x is None else str(x)
     for rgx in DIMENSION_REGEXES:
@@ -307,7 +361,6 @@ def _parse_vat(x):
 
 
 def _build_catalogue_name(df, out, merge_template, merge_fields_raw, merge_dedupe) -> pd.Series:
-    # Template mode
     if merge_template:
         placeholders = [p.strip() for p in PLACEHOLDER_RE.findall(merge_template) if p.strip()]
 
@@ -339,7 +392,6 @@ def _build_catalogue_name(df, out, merge_template, merge_fields_raw, merge_dedup
 
         return pd.Series(merged, index=df.index).str.upper()
 
-    # Fields mode
     if merge_fields_raw:
         fields = [f.strip() for f in merge_fields_raw.split(",") if f.strip()]
         parts = []
@@ -372,7 +424,6 @@ def _build_catalogue_name(df, out, merge_template, merge_fields_raw, merge_dedup
 
         return pd.Series(merged, index=df.index).str.upper()
 
-    # Fallback
     base = out.get("name", "").astype(str).fillna("").str.strip()
     fin = out.get("finish", "").astype(str).fillna("").str.strip()
 
@@ -428,14 +479,12 @@ def _dedupe_supplier_codes(out: pd.DataFrame, df_source: pd.DataFrame, supplier_
     df["__cost_num__"] = pd.to_numeric(df["cost_net"], errors="coerce").fillna(0.0).round(2)
 
     grouped = df.groupby(key_cols, dropna=False)
-
     for _, g in grouped:
         if len(g) <= 1:
             continue
         rrps = g["__rrp_num__"].unique().tolist()
         costs = g["__cost_num__"].unique().tolist()
         if len(rrps) > 1 or len(costs) > 1:
-            # log conflict
             if report_cb is not None:
                 report_cb(g.index[0], "Duplicate supplier_code with different prices. Kept highest RRP row.", "WARN")
 
