@@ -1,0 +1,16 @@
+defaults:
+  # Only pads numeric codes; alphanumeric untouched
+  code_length: 8
+
+  # Recommended description recipe
+  merge_template: "{Short Description} - '{Colour}'"
+  merge_dedupe: true
+
+  dedupe_mode: keep_max_rrp
+  sheet_mode: auto
+
+mapping_overrides:
+  supplier_code: "Material"   # <-- change to your real manufacturer code column if different
+  rrp_net: "Price"            # ex VAT price
+  name: "Short Description"
+  finish: "Colour"

@@ -1,0 +1,11 @@
+defaults:
+  merge_template: "{Range} {Description} - ({Finish})"
+  merge_dedupe: true
+  dedupe_mode: keep_max_rrp
+  sheet_mode: first
+
+mapping_overrides:
+  supplier_code: "Product No."
+  name: "Description"
+  finish: "Finish"
+  rrp_net: "List Price GBP 20"
