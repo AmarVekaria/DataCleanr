@@ -10,6 +10,7 @@ from core.mappings import infer_column_mapping, mapping_audit
 from core.exporters import to_showroom_schema
 from core.discounts import load_discount_rules
 from core.validator import validate_cleaned_dataframe
+from core.presets import list_supplier_presets
 
 from core.presets import (
     load_supplier_preset,
@@ -347,3 +348,21 @@ async def export_showroom(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=showroom_upload.xlsx"},
     )
+
+@app.get("/suppliers")
+async def suppliers():
+    """
+    Lists available preset supplier keys (yaml filenames).
+    """
+    return {"suppliers": list_supplier_presets()}
+
+
+@app.get("/suppliers/{supplier_key}")
+async def supplier_details(supplier_key: str):
+    """
+    Returns the YAML preset contents for a supplier key.
+    """
+    preset = load_supplier_preset(supplier_key)
+    if not preset:
+        return {"supplier": supplier_key, "exists": False, "preset": {}}
+    return {"supplier": supplier_key, "exists": True, "preset": preset}

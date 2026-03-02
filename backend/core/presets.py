@@ -1,10 +1,8 @@
 # backend/core/presets.py
 
 from __future__ import annotations
-import os
 from pathlib import Path
-from typing import Any, Dict, Optional
-
+from typing import Any, Dict, List
 import yaml
 
 
@@ -21,10 +19,24 @@ def _norm_supplier_name(s: str) -> str:
     return (s or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def list_supplier_presets() -> List[str]:
+    """
+    Returns supplier preset keys (filename without .yaml), e.g. ["hansgrohe", "samuel_heath"]
+    """
+    d = _presets_dir()
+    if not d.exists():
+        return []
+    items = []
+    for p in d.glob("*.yaml"):
+        items.append(p.stem)
+    return sorted(items)
+
+
 def load_supplier_preset(supplier: str) -> Dict[str, Any]:
     """
     Loads backend/presets/suppliers/<supplier>.yaml if it exists.
-    Returns a dict with keys like:
+    Returns a dict:
+      - supplier, supplier_key
       - mapping_overrides: dict (canonical_key -> supplier column header)
       - defaults: dict (code_length, merge_template, merge_fields, dedupe_mode, etc.)
     """
@@ -39,26 +51,17 @@ def load_supplier_preset(supplier: str) -> Dict[str, Any]:
     with open(presets_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
-    # Normalise structure
     preset: Dict[str, Any] = {}
     preset["supplier"] = supplier
     preset["supplier_key"] = supplier_key
     preset["mapping_overrides"] = data.get("mapping_overrides", {}) or {}
     preset["defaults"] = data.get("defaults", {}) or {}
-
     return preset
 
 
 def apply_preset_to_mapping(mapping: Dict[str, str], preset: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Applies preset mapping_overrides into inferred mapping.
-    mapping_overrides example:
-      supplier_code: "Product No."
-      rrp_net: "Price"
-    """
     if not preset:
         return mapping
-
     overrides = preset.get("mapping_overrides") or {}
     if overrides:
         mapping.update(overrides)
@@ -66,10 +69,6 @@ def apply_preset_to_mapping(mapping: Dict[str, str], preset: Dict[str, Any]) -> 
 
 
 def apply_preset_to_options(options: Dict[str, Any], preset: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Applies preset defaults into export/cleaner options ONLY if user did not provide them.
-    This lets you keep interactive override ability.
-    """
     if not preset:
         return options
 
@@ -81,7 +80,6 @@ def apply_preset_to_options(options: Dict[str, Any], preset: Dict[str, Any]) -> 
         if key not in options or options[key] in ("", None) or options[key] == 0:
             options[key] = value
 
-    # Common defaults you’ll want supplier-by-supplier
     _set_if_missing("code_length", defaults.get("code_length", None))
     _set_if_missing("merge_template", defaults.get("merge_template", ""))
     _set_if_missing("merge_fields", defaults.get("merge_fields", ""))
@@ -89,7 +87,6 @@ def apply_preset_to_options(options: Dict[str, Any], preset: Dict[str, Any]) -> 
     _set_if_missing("dedupe_mode", defaults.get("dedupe_mode", "keep_max_rrp"))
     _set_if_missing("dedupe_by_supplier_column", defaults.get("dedupe_by_supplier_column", ""))
 
-    # Optional: set sheet defaults
     _set_if_missing("sheet_mode", defaults.get("sheet_mode", ""))
     _set_if_missing("sheet_name", defaults.get("sheet_name", ""))
 
